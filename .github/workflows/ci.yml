@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Both platforms on purpose: file naming depends on Path.GetInvalidFileNameChars(), which
+    # reports only '\0' and '/' on Linux but a much longer set on Windows, and the sink has to
+    # produce names that work on either.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - run: dotnet restore
+
+      - run: dotnet build --no-restore --configuration Release
+
+      - run: dotnet test --no-build --configuration Release
+
+  image:
+    # The Dockerfile drops to a non-root user and chowns the mail directory; a build here catches
+    # a break in that before anyone pulls it.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the container image
+        run: docker build -t mail-sink:ci src/MailSink
+
+      - name: Check it does not run as root
+        run: |
+          user=$(docker run --rm --entrypoint id mail-sink:ci -u)
+          echo "container uid: $user"
+          test "$user" != "0"

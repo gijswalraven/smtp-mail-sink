@@ -1,0 +1,25 @@
+# Normalise everything to LF in the repository and on checkout. The image is built and run on
+# Linux, so a CRLF that sneaks into the Dockerfile or a copied script breaks it in ways that are
+# tedious to diagnose. Keeping the working tree LF too means no line-ending churn in diffs.
+* text=auto eol=lf
+
+*.cs        text eol=lf diff=csharp
+*.csproj    text eol=lf
+*.slnx      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.ps1       text eol=lf
+*.editorconfig text eol=lf
+Dockerfile  text eol=lf
+.gitignore  text eol=lf
+
+# Mail captured during a test run is stored byte for byte; never let git touch it.
+*.eml       -text
+
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.pfx       binary
+*.snk       binary

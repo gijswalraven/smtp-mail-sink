@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-MailSink-9b976ca7-5bc0-4b9b-af80-d3c76021f320</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The test project asserts a couple of internal helpers directly. -->
+    <InternalsVisibleTo Include="MailSink.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="KeyVaultReferenceResolver" Version="2.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+    <PackageReference Include="MimeKit" Version="4.18.1" />
+    <PackageReference Include="SmtpServer" Version="11.1.0" />
+  </ItemGroup>
+</Project>

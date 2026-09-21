@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MailSink/MailSink.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MailSink.Tests/MailSink.Tests.csproj" />
+  </Folder>
+</Solution>

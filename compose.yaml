@@ -1,0 +1,12 @@
+services:
+  mail-sink:
+    build: ./src/MailSink
+    ports:
+      # Loopback only. The sink accepts any recipient -- and, unless MailSink__Username is set,
+      # any credentials -- and Docker's published ports bypass the host firewall, so binding
+      # 0.0.0.0 would hand the whole LAN an open sink. Change to "1025:1025" deliberately if
+      # other machines need to reach it.
+      - "127.0.0.1:1025:1025"
+    volumes:
+      - ./mail:/mail
+    restart: unless-stopped

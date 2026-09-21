@@ -1,0 +1,5 @@
+bin/
+obj/
+mail/
+# Local development secrets. The image reads its password from Key Vault instead.
+appsettings.local.json

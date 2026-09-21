@@ -1,0 +1,25 @@
+version: 2
+
+updates:
+  - package-ecosystem: nuget
+    directory: "/src/MailSink"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: nuget
+    directory: "/tests/MailSink.Tests"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Tracks the sdk and runtime base images in the Dockerfile.
+  - package-ecosystem: docker
+    directory: "/src/MailSink"
+    schedule:
+      interval: weekly
