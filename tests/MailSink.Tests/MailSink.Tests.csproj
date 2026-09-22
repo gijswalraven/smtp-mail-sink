@@ -9,6 +9,9 @@
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <!-- System.Net.Mail.SmtpClient cannot do implicit TLS at all and offers no per-instance
+         certificate callback, so the TLS paths are exercised through MailKit instead. -->
+    <PackageReference Include="MailKit" Version="4.18.0" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />

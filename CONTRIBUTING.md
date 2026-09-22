@@ -40,8 +40,9 @@ couple of habits worth keeping:
 ## Security
 
 Please do not open a public issue for a security problem. [SECURITY.md](SECURITY.md) explains what
-counts as one here — several of this tool's more alarming properties are deliberate — and how to
-report it privately.
+counts as one here — the sink is strict outside the `Development` environment and deliberately
+relaxed inside it, so which environment a finding applies to is the first thing to establish — and
+how to report it privately.
 
 ## Pull requests
 

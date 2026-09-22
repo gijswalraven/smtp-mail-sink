@@ -1,12 +1,13 @@
-using System.Net;
+using System.Globalization;
 using System.Net.Mail;
 using MimeKit;
 
 namespace MailSink.Tests;
 
 /// <summary>
-/// Boots the real listener on a free port against a temporary folder and sends through
-/// System.Net.Mail, so the SmtpServer wiring, capture pipeline and file writer are all exercised.
+/// Boots the real listener on a free port against a temporary folder, so the SmtpServer wiring,
+/// capture pipeline and file writer are all exercised. Runs in the Development mode -- plain text,
+/// no credentials -- because these assert what is captured, not how the session was secured.
 /// </summary>
 public sealed class SinkEndToEndTests : IAsyncLifetime
 {
@@ -29,12 +30,14 @@ public sealed class SinkEndToEndTests : IAsyncLifetime
         message.AlternateViews.Add(AlternateView.CreateAlternateViewFromString(
             "<h1>Bedankt</h1>", null, "text/html"));
 
-        _sink.Send(message);
+        await _sink.SendAsync(message);
 
         var path = await _sink.WaitForSingleFileAsync();
 
         Assert.Contains("Factuur-1234", Path.GetFileName(path));
-        Assert.Equal(DateTimeOffset.Now.ToString("yyyy-MM-dd"), Path.GetFileName(Path.GetDirectoryName(path)));
+        Assert.Equal(
+            DateTimeOffset.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            Path.GetFileName(Path.GetDirectoryName(path)));
 
         var parsed = await MimeMessage.LoadAsync(path);
         Assert.Equal("Factuur 1234", parsed.Subject);
@@ -55,7 +58,7 @@ public sealed class SinkEndToEndTests : IAsyncLifetime
             using var message = new MailMessage("app@example.test", "gijs@example.test", "With attachment", "body");
             message.Attachments.Add(new Attachment(attachmentPath));
 
-            _sink.Send(message);
+            await _sink.SendAsync(message);
 
             var parsed = await MimeMessage.LoadAsync(await _sink.WaitForSingleFileAsync());
             var attachment = Assert.Single(parsed.Attachments.OfType<MimePart>());
@@ -72,13 +75,21 @@ public sealed class SinkEndToEndTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Any_credentials_are_accepted()
+    public async Task A_hostile_subject_is_still_captured_under_a_safe_name()
     {
-        using var message = new MailMessage("app@example.test", "gijs@example.test", "Authenticated", "body");
+        using var message = new MailMessage("app@example.test", "gijs@example.test", subject: null, "body")
+        {
+            // An ANSI escape, a right-to-left override, and enough four-byte runes to blow the
+            // 255-byte file name limit if they were counted as characters.
+            Subject = "\u001b[2J‮" + string.Concat(Enumerable.Repeat("\U0001F4E7", 120)),
+        };
 
-        _sink.Send(message, new NetworkCredential("whoever", "whatever"));
+        await _sink.SendAsync(message);
 
-        var parsed = await MimeMessage.LoadAsync(await _sink.WaitForSingleFileAsync());
-        Assert.Equal("Authenticated", parsed.Subject);
+        var path = await _sink.WaitForSingleFileAsync();
+        var fileName = Path.GetFileName(path);
+
+        Assert.True(System.Text.Encoding.UTF8.GetByteCount(fileName) <= 255);
+        Assert.DoesNotContain(fileName, char.IsControl);
     }
 }

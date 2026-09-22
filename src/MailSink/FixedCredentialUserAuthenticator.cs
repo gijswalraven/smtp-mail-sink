@@ -7,9 +7,8 @@ using SmtpServer.Authentication;
 namespace MailSink;
 
 /// <summary>
-/// Accepts exactly one username/password pair. Registered instead of
-/// <see cref="AcceptAnyUserAuthenticator"/> when MailSink:Username is configured, so a test can
-/// assert that an application sends the credentials it was told to send.
+/// Accepts exactly one username/password pair, the only authenticator the sink has. Registered
+/// whenever MailSink:Username is configured, which is mandatory outside Development.
 /// </summary>
 public sealed class FixedCredentialUserAuthenticator(
     IOptions<MailSinkOptions> options,
@@ -34,17 +33,22 @@ public sealed class FixedCredentialUserAuthenticator(
         }
         else
         {
-            // The password never reaches the log; the username does, because knowing which
-            // account an application tried is the whole point of turning this on.
-            logger.LogWarning("Rejected SMTP AUTH for {User}: credentials do not match", user);
+            // The password never reaches the log; the username and the client address do,
+            // because a run of these is what a SIEM should be alerting on. SmtpServer drops the
+            // session after MailSink:MaxAuthenticationAttempts of them.
+            logger.LogWarning(
+                "Rejected SMTP AUTH for {User} from {Client}: credentials do not match",
+                user,
+                SessionClient.Describe(context) ?? "an unknown address");
         }
 
         return Task.FromResult(accepted);
     }
 
     /// <summary>
-    /// Compares in constant time. Length still leaks, and a sink is not a security boundary, but
-    /// the credentials are an application's real SMTP credentials often enough to be worth it.
+    /// Compares in constant time. The length of the configured pair still leaks, which is not
+    /// worth defending against here, but the comparison itself must not be what tells an attacker
+    /// how much of a guess was right.
     /// </summary>
     private static bool Matches(string expected, string actual) =>
         CryptographicOperations.FixedTimeEquals(

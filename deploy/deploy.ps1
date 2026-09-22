@@ -30,10 +30,12 @@
     Private (default) puts the container group in a VNet with no public IP. Only reachable from
     that VNet - peered networks, VPN, or other Azure resources in it.
 
-    Public gives it a public IP and an <dns-label>.<region>.azurecontainer.io FQDN. Convenient, but
-    the sink accepts any recipient, so internet scanners will eventually find the port and fill
-    your file share with junk. Public exposure therefore defaults to -RequireAuthentication $true.
-    Use it only for a short-lived test.
+    Public gives it a public IP and an <dns-label>.<region>.azurecontainer.io FQDN. Every session
+    has to authenticate over TLS either way, but the sink still accepts any recipient, so a public
+    endpoint will be found by scanners and probed. Prefer Private unless you need otherwise.
+
+    The certificate is issued for that FQDN when Public, so senders can verify it by name. Pass
+    -CertificateSubject to issue it for the name your senders will actually use instead.
 
 .PARAMETER SmtpUsername
     Username the sink will require. Stored in the key vault alongside the password.
@@ -46,9 +48,14 @@
 .PARAMETER RotatePassword
     Replace the stored password with a freshly generated one, even though a secret already exists.
 
-.PARAMETER RequireAuthentication
-    Refuse mail from senders that do not authenticate. Defaults to $true for -Exposure Public,
-    where the endpoint is reachable from the internet, and $false for Private.
+.PARAMETER CertificateSubject
+    Host name the TLS certificate is issued for. Defaults to the container group's public FQDN for
+    -Exposure Public, and to <name-prefix>.internal for Private, where there is no name to use.
+    Set it to whatever senders will put in their SMTP host setting.
+
+    The certificate is self-signed, because nothing else can be issued without a public DNS zone.
+    Senders must therefore trust it explicitly. Replace it in the key vault with one from your own
+    CA to avoid that, and the sink will pick the replacement up on its next restart.
 
 .PARAMETER UseAdminCredentials
     Pull the image with the registry's admin username/password instead of the managed identity.
@@ -86,7 +93,11 @@ param(
     # Public only. Must be globally unique within the region.
     [string]$DnsLabel,
 
-    [int]$Port = 1025,
+    # Both submission ports are privileged, and the container runs as a non-root user that may
+    # not bind them, so the sink listens high and the container group publishes these.
+    [int]$StartTlsPort = 2587,
+    [int]$ImplicitTlsPort = 2465,
+
     [string]$TimeZone = 'Europe/Amsterdam',
     [string]$Cpu = '0.5',
     [string]$Memory = '1',
@@ -98,8 +109,8 @@ param(
     [string]$SmtpPassword,
     [switch]$RotatePassword,
 
-    # $null means "decide from -Exposure": required when Public, optional when Private.
-    [nullable[bool]]$RequireAuthentication = $null,
+    # Empty means "derive from -Exposure": the public FQDN, or <prefix>.internal when private.
+    [string]$CertificateSubject,
 
     # Rebuild even when an image tagged with the current source hash already exists.
     [switch]$ForceBuild,
@@ -228,6 +239,64 @@ function Set-VaultSecret {
     }
 }
 
+# A self-signed certificate, because nothing else can be issued without a public DNS zone to
+# prove control of. az takes a policy only as a file, which suits us: the policy is long.
+function New-VaultCertificate {
+    param(
+        [Parameter(Mandatory)][string]$VaultName,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Subject
+    )
+
+    # exportable is the setting that matters: without it the private key cannot be read back
+    # through the secret of the same name, and a certificate the sink cannot download in full is
+    # no use for terminating TLS.
+    $policy = [ordered]@{
+        issuerParameters          = @{ name = 'Self' }
+        keyProperties             = [ordered]@{
+            exportable = $true
+            keySize    = 2048
+            keyType    = 'RSA'
+            reuseKey   = $false
+        }
+        secretProperties          = @{ contentType = 'application/x-pkcs12' }
+        x509CertificateProperties = [ordered]@{
+            subject                 = "CN=$Subject"
+            subjectAlternativeNames = @{ dnsNames = @($Subject) }
+            validityInMonths        = 12
+            keyUsage                = @('digitalSignature', 'keyEncipherment')
+            ekus                    = @('1.3.6.1.5.5.7.3.1')
+        }
+        lifetimeActions           = @(
+            @{
+                trigger = @{ daysBeforeExpiry = 30 }
+                action  = @{ actionType = 'AutoRenew' }
+            }
+        )
+    }
+
+    $file = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+    try {
+        [IO.File]::WriteAllText($file, ($policy | ConvertTo-Json -Depth 6))
+
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                Invoke-Az @('keyvault', 'certificate', 'create', '--vault-name', $VaultName,
+                    '-n', $Name, '--policy', "@$file", '-o', 'none') | Out-Null
+                return
+            }
+            catch {
+                if ($attempt -ge 8) { throw }
+                Write-Host "    waiting for the vault role assignment to reach the data plane (attempt $attempt)"
+                Start-Sleep -Seconds 10
+            }
+        }
+    }
+    finally {
+        Remove-Item $file -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-VaultSecret {
     param([Parameter(Mandatory)][string]$VaultName, [Parameter(Mandatory)][string]$Name)
 
@@ -250,11 +319,21 @@ if ($Exposure -eq 'Public' -and -not $DnsLabel) {
     throw 'A -DnsLabel is required when -Exposure is Public.'
 }
 
-# A public endpoint is found by scanners within hours, so it defaults to demanding AUTH. A private
-# one stays open by default, because that is what makes a sink convenient to point things at.
-if ($null -eq $RequireAuthentication) {
-    $RequireAuthentication = ($Exposure -eq 'Public')
+# Senders verify the certificate against the name they connect to. A public deployment has one
+# that is known in advance; a private one has only an IP, so it gets a stable placeholder that
+# whoever runs it can point DNS at -- or override with -CertificateSubject.
+if (-not $CertificateSubject) {
+    $CertificateSubject = if ($Exposure -eq 'Public') {
+        "$DnsLabel.$Location.azurecontainer.io"
+    }
+    else {
+        "$NamePrefix.internal"
+    }
 }
+
+# Nothing to decide any more: outside the Development environment the sink refuses to start
+# without a credential pair and a certificate, and refuses mail from a session that has not used
+# both. The container has no DOTNET_ENVIRONMENT set, so it runs as Production.
 
 if ($Subscription) {
     Invoke-Az @('account', 'set', '--subscription', $Subscription) | Out-Null
@@ -298,6 +377,7 @@ $shareName = 'mail'
 
 $usernameSecret = 'mailsink-smtp-username'
 $passwordSecret = 'mailsink-smtp-password'
+$tlsCertificate = 'mailsink-smtp-tls'
 
 if ($storageName.Length -gt 24) { throw "-NamePrefix is too long; the storage account name '$storageName' exceeds 24 characters." }
 if ($vaultName.Length -gt 24) { throw "-NamePrefix is too long; the key vault name '$vaultName' exceeds 24 characters." }
@@ -531,10 +611,39 @@ finally {
 
 $newVaultAssignment = Grant-Role -PrincipalId $principalId -Role 'Key Vault Secrets User' -Scope $vaultId
 
+Step "Key vault certificate ($tlsCertificate)"
+
+Grant-Role -PrincipalId $callerObjectId -Role 'Key Vault Certificates Officer' -Scope $vaultId -PrincipalType $callerType | Out-Null
+
+# Reissuing on every run would hand senders a new certificate to trust each time, so the stored
+# one is kept unless it is for a different name than the deployment now uses.
+$currentSubject = & az keyvault certificate show --vault-name $vaultName -n $tlsCertificate --query 'policy.x509CertificateProperties.subject' -o tsv 2>$null
+$global:LASTEXITCODE = 0
+
+if ($currentSubject -eq "CN=$CertificateSubject") {
+    Write-Host "    certificate for '$CertificateSubject' already stored"
+}
+else {
+    if ($currentSubject) {
+        Write-Host "    reissuing: the stored certificate is '$currentSubject', not 'CN=$CertificateSubject'"
+    }
+    else {
+        Write-Host "    issuing a self-signed certificate for '$CertificateSubject'"
+    }
+
+    New-VaultCertificate -VaultName $vaultName -Name $tlsCertificate -Subject $CertificateSubject
+}
+
+# The sink downloads the private key through the secret backing the certificate, so it needs both
+# roles: Certificate User to see the certificate, Secrets User (granted just above) to read it.
+if (Grant-Role -PrincipalId $principalId -Role 'Key Vault Certificate User' -Scope $vaultId) {
+    $newVaultAssignment = $true
+}
+
 # The container is handed vault URIs, not secrets. Versionless, so restarting picks up a rotation.
 $usernameReference = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$usernameSecret)"
 $passwordReference = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$passwordSecret)"
-$requireAuth = $RequireAuthentication.ToString().ToLowerInvariant()
+$certificateUri = "https://$vaultHost/certificates/$tlsCertificate"
 
 $containerArgs = @(
     'container', 'create',
@@ -546,7 +655,7 @@ $containerArgs = @(
     '--cpu', $Cpu,
     '--memory', $Memory,
     '--restart-policy', 'Always',
-    '--ports', $Port,
+    '--ports', $StartTlsPort, $ImplicitTlsPort,
     '--protocol', 'TCP',
     '--azure-file-volume-account-name', $storageName,
     '--azure-file-volume-account-key', $storageKey,
@@ -558,11 +667,15 @@ $containerArgs = @(
         # references read as unbalanced grouping -- cmd fails with "MailSink__Password was
         # unexpected at this time" before az is ever invoked. Quoting keeps each value one token.
         (Quote 'MailSink__MailDirectory=/mail'),
-        (Quote "MailSink__Ports__0=$Port"),
+        # The image already listens on these two, but naming them here keeps the published ports
+        # and the listener from drifting apart when either is changed.
+        (Quote "MailSink__StartTlsPorts__0=$StartTlsPort"),
+        (Quote "MailSink__ImplicitTlsPorts__0=$ImplicitTlsPort"),
         (Quote "TZ=$TimeZone"),
         (Quote "MailSink__Username=$usernameReference"),
         (Quote "MailSink__Password=$passwordReference"),
-        (Quote "MailSink__RequireAuthentication=$requireAuth"),
+        # Not a secret: the certificate's private key is fetched through the managed identity.
+        (Quote "MailSink__Tls__KeyVaultCertificateUri=$certificateUri"),
         # Naming the one vault the sink may read means a reference pointing anywhere else is
         # refused rather than fetched.
         (Quote "MailSink__KeyVault__AllowedHosts__0=$vaultHost"),
@@ -611,15 +724,16 @@ try {
         image       = "$loginServer/$imageTag"
         cpu         = [double]$Cpu
         memory      = [double]$Memory
-        port        = [int]$Port
+        ports       = @([int]$StartTlsPort, [int]$ImplicitTlsPort)
         env         = @{
-            'MailSink__MailDirectory'                    = '/mail'
-            'MailSink__Ports__0'                         = "$Port"
-            'TZ'                                         = $TimeZone
-            'MailSink__Username'                         = $usernameReference
-            'MailSink__Password'                         = $passwordReference
-            'MailSink__RequireAuthentication'            = $requireAuth
-            'MailSink__KeyVault__AllowedHosts__0'        = $vaultHost
+            'MailSink__MailDirectory'                     = '/mail'
+            'MailSink__StartTlsPorts__0'                  = "$StartTlsPort"
+            'MailSink__ImplicitTlsPorts__0'               = "$ImplicitTlsPort"
+            'TZ'                                          = $TimeZone
+            'MailSink__Username'                          = $usernameReference
+            'MailSink__Password'                          = $passwordReference
+            'MailSink__Tls__KeyVaultCertificateUri'       = $certificateUri
+            'MailSink__KeyVault__AllowedHosts__0'         = $vaultHost
             'MailSink__KeyVault__ManagedIdentityClientId' = $identityClientId
         }
     }
@@ -643,7 +757,7 @@ try {
         $unchanged = $c.image -eq $desired.image -and
             [double]$c.resources.requests.cpu -eq $desired.cpu -and
             [double]$c.resources.requests.memoryInGb -eq $desired.memory -and
-            @($c.ports.port) -contains $desired.port -and
+            -not (@($desired.ports) | Where-Object { @($c.ports.port) -notcontains $_ }) -and
             $current.instanceView.state -eq 'Running' -and
             $envMatches
     }
@@ -721,14 +835,22 @@ else {
     Write-Host "  SMTP host : $ip (private, reachable from $VNetName only)"
 }
 
-Write-Host "  SMTP port : $Port (no TLS)"
+Write-Host "  SMTP port : $StartTlsPort (STARTTLS), $ImplicitTlsPort (implicit TLS)"
 Write-Host "  SMTP user : $SmtpUsername"
-Write-Host "  Auth      : $(if ($RequireAuthentication) { 'required' } else { 'optional -- mail is accepted without it' })"
+Write-Host '  Auth      : required, over TLS only'
+Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
 Write-Host "  Mail share: $storageName/$shareName"
 Write-Host ''
 Write-Host 'The password is in the key vault; the container reads it through its managed identity.'
 Write-Host 'Read it back when you need to configure a sender:'
 Write-Host "  az keyvault secret show --vault-name $vaultName -n $passwordSecret --query value -o tsv"
+Write-Host ''
+Write-Host 'The certificate is self-signed, so senders must be told to trust it. Export the public'
+Write-Host 'half and install it wherever the sending application keeps its trusted roots:'
+Write-Host "  az keyvault certificate download --vault-name $vaultName -n $tlsCertificate -f mailsink.crt"
+Write-Host ''
+Write-Host 'Senders must also reach it by the name on the certificate. Connecting to the bare IP'
+Write-Host 'will fail host name validation, which is the check doing the work here.'
 Write-Host ''
 
 if ($newVaultAssignment) {

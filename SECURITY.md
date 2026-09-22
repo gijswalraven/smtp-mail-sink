@@ -2,33 +2,57 @@
 
 ## What this project is
 
-mail sink is a **development and test tool**. It runs an SMTP server that accepts every message
-offered to it and writes it to disk. By design it:
+mail sink is an SMTP server that accepts mail and writes it to disk as `.eml` files, so you can
+see exactly what an application sent. It is built to run in a deployed environment, not only on a
+developer's machine.
 
-- accepts mail without authentication,
-- accepts any username and password when `AllowAnyCredentials` is on,
-- accepts any recipient address,
-- speaks plain SMTP with no TLS,
-- stores every message unencrypted on disk, headers and body included.
+Outside the `Development` environment it refuses to start unless it has a credential pair and a
+TLS certificate, and it then refuses:
 
-None of the above is a vulnerability. They are the product. Reports that amount to "it accepts any
-password" or "the traffic is not encrypted" will be closed with a pointer to this page.
+- any session that has not authenticated, and
+- any session that is not encrypted with TLS 1.2 or better.
 
-It follows that the sink belongs on a trusted network — a developer machine, a CI runner, a private
-VNet — and never on a public endpoint you care about. Anything it captures should be treated as
-readable by anyone who can reach the host or the storage behind it.
+AUTH is never advertised across an unencrypted connection, so credentials cannot cross the wire in
+the clear even from a client that would have been willing to send them.
+
+What the sink still does by design:
+
+- accepts any recipient address — it is a sink, not a router, and nothing is ever forwarded,
+- stores every message unencrypted on disk, headers and body included,
+- in the `Development` environment **only**, listens in plain text and, unless a credential pair
+  is configured, accepts mail from anyone. This is what keeps a local run zero-configuration.
+
+That last point is a deliberate, bounded exception. `deploy.ps1` never sets `DOTNET_ENVIRONMENT`,
+so a deployed container runs as `Production` and gets the strict rules; and a plain-text port
+configured outside `Development` is a startup error rather than a quiet downgrade.
+
+The unencrypted store is the part to plan around. Anything the sink captures is readable by anyone
+who can reach the host or the storage behind it — the transport and the credentials are protected,
+the mail at rest is not. Treat the mail directory, and the Azure Files share behind it, as the
+boundary that actually protects captured mail.
+
+Reports that amount to "the Development mode accepts any password" or "stored messages are not
+encrypted" will be closed with a pointer to this page.
 
 ## What is a vulnerability
 
 Report it if you find a way to:
 
-- escape the configured mail directory and read or write elsewhere on the host, for example through
-  a crafted subject, envelope address, or header,
+- deliver a message without authenticating, or across an unencrypted connection, in any
+  environment other than `Development`,
+- downgrade or strip the TLS: negotiate below TLS 1.2, get `AUTH` advertised or accepted before
+  STARTTLS has completed, or get the sink to present a certificate it was not configured with,
+- make `FixedCredentialUserAuthenticator` accept a credential pair it was not configured with, or
+  learn something about the configured pair from the timing or the content of a rejection,
+- get past `MaxAuthenticationAttempts`, `MaxConcurrentSessions` or `MaxSessionsPerClient`, or
+  otherwise make one client deny the sink to others,
+- escape the configured mail directory and read or write elsewhere on the host, for example
+  through a crafted subject, envelope address, or header,
 - execute code in the sink process by sending it a message,
 - crash or wedge the process with a single message or a small number of connections, beyond the
-  configured `MaxMessageSize` and `MaxConcurrentSessions` limits,
-- make `FixedCredentialUserAuthenticator` accept a credential pair it was not configured with,
-- recover a configured password from a log, a file name, or a stored message,
+  configured `MaxMessageSize` and session limits,
+- recover a configured password, or the certificate's private key, from a log, a file name, or a
+  stored message,
 - obtain the Azure storage key from anything the deployment scripts do.
 
 ## Reporting

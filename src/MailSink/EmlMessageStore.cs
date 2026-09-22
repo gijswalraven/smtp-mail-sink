@@ -1,7 +1,5 @@
 using System.Buffers;
-using System.Net;
 using SmtpServer;
-using SmtpServer.Net;
 using SmtpServer.Protocol;
 using SmtpServer.Storage;
 
@@ -24,7 +22,7 @@ public sealed class EmlMessageStore(IMailCapture capture) : MessageStore
             Raw: buffer.ToArray(),
             From: Format(transaction.From),
             To: [.. transaction.To.Select(Format)],
-            ClientAddress: ReadClientAddress(context));
+            ClientAddress: SessionClient.Describe(context));
 
         var result = await capture.CaptureAsync(message, cancellationToken);
 
@@ -32,12 +30,6 @@ public sealed class EmlMessageStore(IMailCapture capture) : MessageStore
             ? SmtpResponse.Ok
             : new SmtpResponse(SmtpReplyCode.TransactionFailed, "Could not store message");
     }
-
-    private static string? ReadClientAddress(ISessionContext context) =>
-        context.Properties.TryGetValue(EndpointListener.RemoteEndPointKey, out var remote) &&
-        remote is IPEndPoint endPoint
-            ? endPoint.ToString()
-            : null;
 
     private static string Format(SmtpServer.Mail.IMailbox? mailbox) =>
         mailbox is null || string.IsNullOrEmpty(mailbox.Host)

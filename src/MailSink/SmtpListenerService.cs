@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Net;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SmtpServer;
 using SmtpServerCore = SmtpServer.SmtpServer;
@@ -9,23 +11,39 @@ namespace MailSink;
 public sealed class SmtpListenerService(
     IOptions<MailSinkOptions> options,
     IMailWriter writer,
+    IHostEnvironment environment,
     IServiceProvider serviceProvider,
     ILogger<SmtpListenerService> logger) : BackgroundService
 {
     private readonly MailSinkOptions _options = options.Value;
 
     /// <summary>
-    /// Sessions currently being served. A set keyed on the session rather than a counter, because
-    /// a session ends through exactly one of three events and removing a key twice is harmless --
-    /// a counter would drift out of step the first time that assumption failed.
+    /// Sessions currently being served, each against the address it came from. A map keyed on the
+    /// session rather than a counter, because a session ends through exactly one of three events
+    /// and removing a key twice is harmless -- a counter would drift out of step the first time
+    /// that assumption failed. The per-client tally is derived by scanning the values, which is
+    /// cheap at these sizes and cannot fall out of step with the sessions it counts.
     /// </summary>
-    private readonly ConcurrentDictionary<ISessionContext, byte> _sessions = new();
+    private readonly ConcurrentDictionary<ISessionContext, IPAddress?> _sessions = new();
 
     private SmtpServerCore? _server;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _server = new SmtpServerCore(SmtpOptionsFactory.Build(_options), serviceProvider);
+        var isDevelopment = environment.IsDevelopment();
+        var certificateFactory = serviceProvider.GetService<ICertificateFactory>();
+
+        // Pull the certificate down before the first client rather than during its handshake, so
+        // an unreachable vault or a certificate without a private key fails the host with a clear
+        // error instead of showing up as a TLS reset.
+        if (certificateFactory is KeyVaultCertificateFactory keyVaultCertificates)
+        {
+            keyVaultCertificates.Current();
+        }
+
+        _server = new SmtpServerCore(
+            SmtpOptionsFactory.Build(_options, isDevelopment, certificateFactory),
+            serviceProvider);
 
         _server.SessionCreated += OnSessionCreated;
         _server.SessionCompleted += OnSessionEnded;
@@ -37,11 +55,19 @@ public sealed class SmtpListenerService(
         };
 
         logger.LogInformation(
-            "mail sink listening on {Address} port(s) {Ports}; auth: {Auth}; writing .eml files to {Destination}",
+            "mail sink listening on {Address}; {Transport}; auth: {Auth}; writing .eml files to {Destination}",
             _options.ListenAddress,
-            string.Join(", ", SmtpOptionsFactory.ResolvePorts(_options)),
+            DescribeTransport(_options, isDevelopment),
             DescribeAuthentication(_options),
             writer.Destination);
+
+        if (SmtpOptionsFactory.IsPlainText(_options, isDevelopment))
+        {
+            logger.LogWarning(
+                "This sink is running in the Development environment: the connection is not " +
+                "encrypted{Unauthenticated}. Do not expose it beyond your own machine.",
+                _options.HasCredentials ? string.Empty : " and mail is accepted from anyone");
+        }
 
         try
         {
@@ -53,44 +79,88 @@ public sealed class SmtpListenerService(
         }
     }
 
+    /// <summary>One line for the startup log, so the transport in force is never in doubt.</summary>
+    private static string DescribeTransport(MailSinkOptions options, bool isDevelopment)
+    {
+        if (SmtpOptionsFactory.IsPlainText(options, isDevelopment))
+        {
+            return $"plain text on port(s) {string.Join(", ", SmtpOptionsFactory.ResolvePorts(options))}, no TLS";
+        }
+
+        var (startTls, implicitTls) = SmtpOptionsFactory.ResolveTlsPorts(options);
+
+        var parts = new List<string>(2);
+        if (startTls.Length > 0)
+        {
+            parts.Add($"STARTTLS on port(s) {string.Join(", ", startTls)}");
+        }
+
+        if (implicitTls.Length > 0)
+        {
+            parts.Add($"implicit TLS on port(s) {string.Join(", ", implicitTls)}");
+        }
+
+        var floor = options.Tls.MinimumProtocol == TlsProtocolFloor.Tls13 ? "TLS 1.3" : "TLS 1.2+";
+        return $"{string.Join("; ", parts)} ({floor})";
+    }
+
     /// <summary>
     /// One line for the startup log, so a misconfigured credential pair shows up immediately
     /// rather than as an unexplained 535 in the sending application.
     /// </summary>
-    private static string DescribeAuthentication(MailSinkOptions options)
-    {
-        var offer = options switch
-        {
-            { HasFixedCredentials: true } => $"credentials for '{options.Username}'",
-            { AllowAnyCredentials: true } => "any credentials",
-            _ => "none advertised",
-        };
-
-        return options.RequireAuthentication ? $"{offer}, required" : $"{offer}, optional";
-    }
+    private static string DescribeAuthentication(MailSinkOptions options) =>
+        options.HasCredentials
+            ? $"required, credentials for '{options.Username}'"
+            : "none -- mail is accepted from anyone";
 
     /// <summary>
-    /// Drops the connection when the sink is already serving as many sessions as it is willing to.
-    /// Without this, every concurrent sender can pin another MaxMessageSize of memory.
+    /// Drops the connection when the sink is already serving as many sessions as it is willing
+    /// to, either overall or from this one client. Without the global cap, every concurrent
+    /// sender can pin another MaxMessageSize of memory; without the per-client one, a single host
+    /// can take the whole budget and starve everyone else.
     /// </summary>
     private void OnSessionCreated(object? sender, SessionEventArgs e)
     {
-        _sessions.TryAdd(e.Context, 0);
+        var address = SessionClient.Address(e.Context);
+        _sessions[e.Context] = address;
 
-        if (_options.MaxConcurrentSessions <= 0 || _sessions.Count <= _options.MaxConcurrentSessions)
+        if (!ExceedsLimit(address, out var reason))
         {
             return;
         }
 
         _sessions.TryRemove(e.Context, out _);
         logger.LogWarning(
-            "Refusing session {SessionId}: already at the MaxConcurrentSessions limit of {Limit}",
+            "Refusing session {SessionId} from {Client}: {Reason}",
             e.Context.SessionId,
-            _options.MaxConcurrentSessions);
+            address?.ToString() ?? "an unknown address",
+            reason);
 
         // Closing the pipe is the only way to turn a session away at this point; the session then
         // ends through SessionFaulted, which is expected here rather than a problem.
         (e.Context.Pipe as IDisposable)?.Dispose();
+    }
+
+    private bool ExceedsLimit(IPAddress? address, out string reason)
+    {
+        if (_options.MaxConcurrentSessions > 0 && _sessions.Count > _options.MaxConcurrentSessions)
+        {
+            reason = $"already at the MaxConcurrentSessions limit of {_options.MaxConcurrentSessions}";
+            return true;
+        }
+
+        if (address is not null && _options.MaxSessionsPerClient > 0)
+        {
+            var fromClient = _sessions.Count(session => address.Equals(session.Value));
+            if (fromClient > _options.MaxSessionsPerClient)
+            {
+                reason = $"already at the MaxSessionsPerClient limit of {_options.MaxSessionsPerClient} for this client";
+                return true;
+            }
+        }
+
+        reason = string.Empty;
+        return false;
     }
 
     private void OnSessionEnded(object? sender, SessionEventArgs e) => _sessions.TryRemove(e.Context, out _);

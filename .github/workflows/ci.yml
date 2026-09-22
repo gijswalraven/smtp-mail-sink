@@ -11,9 +11,10 @@ permissions:
 
 jobs:
   test:
-    # Both platforms on purpose: file naming depends on Path.GetInvalidFileNameChars(), which
-    # reports only '\0' and '/' on Linux but a much longer set on Windows, and the sink has to
-    # produce names that work on either.
+    # Both platforms on purpose. File naming no longer asks the OS which characters are legal --
+    # that difference was the bug -- but the two still disagree about path separators, path
+    # comparison case, the file name length limit, and which key storage flags SChannel will
+    # accept for a TLS certificate. All four are load-bearing here.
     strategy:
       fail-fast: false
       matrix:

@@ -1,34 +1,66 @@
 using System.Net;
 using System.Net.Mail;
 using System.Net.Sockets;
+using MailKit.Net.Smtp;
+using MailKit.Security;
 using MailSink;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using MimeKit;
+using SmtpServer;
+using SmtpClient = MailKit.Net.Smtp.SmtpClient;
 
 namespace MailSink.Tests;
+
+/// <summary>How a <see cref="TestSink"/> listens, and so how a client must connect to it.</summary>
+public enum SinkTransport
+{
+    /// <summary>Plain text, the Development-only mode. Credentials are optional here.</summary>
+    PlainText,
+
+    /// <summary>Port 587 style: plain connect, STARTTLS before AUTH.</summary>
+    StartTls,
+
+    /// <summary>Port 465 style: TLS from the first byte.</summary>
+    ImplicitTls,
+}
 
 /// <summary>
 /// A real sink on a free port writing to a temp folder, so the SmtpServer wiring, capture
 /// pipeline and file writer are all exercised. Shared by the end-to-end test classes, which differ
-/// only in the settings they pass.
+/// only in the transport and settings they pass.
 /// </summary>
 internal sealed class TestSink : IAsyncDisposable
 {
+    /// <summary>
+    /// A URI that only has to parse and pass the allow-list: the factory that would fetch it is
+    /// replaced below, because a test cannot reach Key Vault. Its presence is what tells
+    /// <see cref="MailSinkOptions.Validate"/> that TLS is configured.
+    /// </summary>
+    private const string CertificateUri =
+        "https://kv-mailsink-test.vault.azure.net/certificates/mailsink-smtp";
+
     private readonly IHost _host;
 
-    private TestSink(IHost host, int port, string mailDirectory)
+    private TestSink(IHost host, int port, string mailDirectory, SinkTransport transport)
     {
         _host = host;
         Port = port;
         MailDirectory = mailDirectory;
+        Transport = transport;
     }
 
     public int Port { get; }
 
     public string MailDirectory { get; }
 
-    public static async Task<TestSink> StartAsync(IDictionary<string, string?>? settings = null)
+    public SinkTransport Transport { get; }
+
+    public static async Task<TestSink> StartAsync(
+        IDictionary<string, string?>? settings = null,
+        SinkTransport transport = SinkTransport.PlainText)
     {
         var mailDirectory = Path.Combine(
             Path.GetTempPath(), "mail-sink-tests", Guid.NewGuid().ToString("n"));
@@ -38,31 +70,100 @@ internal sealed class TestSink : IAsyncDisposable
         {
             ["MailSink:MailDirectory"] = mailDirectory,
             ["MailSink:ListenAddress"] = "127.0.0.1",
-            ["MailSink:Ports:0"] = port.ToString(),
+            [PortKey(transport)] = port.ToString(),
         };
+
+        if (transport != SinkTransport.PlainText)
+        {
+            configuration["MailSink:Tls:KeyVaultCertificateUri"] = CertificateUri;
+        }
 
         foreach (var (key, value) in settings ?? new Dictionary<string, string?>())
         {
             configuration[key] = value;
         }
 
-        var builder = Host.CreateApplicationBuilder();
+        // Plain text is only legal in Development; everything else runs as the deployed sink does,
+        // so the strict validation and the TLS wiring are what the tests actually exercise.
+        var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
+        {
+            EnvironmentName = transport == SinkTransport.PlainText
+                ? Environments.Development
+                : Environments.Production,
+        });
+
         builder.Configuration.AddInMemoryCollection(configuration);
-        builder.Services.AddMailSink(builder.Configuration);
+        builder.Services.AddMailSink(builder.Configuration, builder.Environment);
+
+        if (transport != SinkTransport.PlainText)
+        {
+            // Swap the Key Vault factory for a local certificate. Everything downstream of it --
+            // endpoint wiring, protocol floor, STARTTLS negotiation -- is the production path.
+            builder.Services.RemoveAll<ICertificateFactory>();
+            builder.Services.AddSingleton<ICertificateFactory>(
+                new FakeCertificateFactory(TestCertificate.Shared));
+        }
 
         var host = builder.Build();
         await host.StartAsync();
+        await WaitUntilListeningAsync(port);
 
-        return new TestSink(host, port, mailDirectory);
+        return new TestSink(host, port, mailDirectory, transport);
     }
 
-    public SmtpClient CreateClient(NetworkCredential? credentials = null) =>
-        new("127.0.0.1", Port) { Timeout = 15000, Credentials = credentials };
-
-    public void Send(MailMessage message, NetworkCredential? credentials = null)
+    private static string PortKey(SinkTransport transport) => transport switch
     {
-        using var client = CreateClient(credentials);
-        client.Send(message);
+        SinkTransport.PlainText => "MailSink:Ports:0",
+        SinkTransport.StartTls => "MailSink:StartTlsPorts:0",
+        SinkTransport.ImplicitTls => "MailSink:ImplicitTlsPorts:0",
+        _ => throw new ArgumentOutOfRangeException(nameof(transport)),
+    };
+
+    private SecureSocketOptions SocketOptions => Transport switch
+    {
+        SinkTransport.PlainText => SecureSocketOptions.None,
+        SinkTransport.StartTls => SecureSocketOptions.StartTls,
+        SinkTransport.ImplicitTls => SecureSocketOptions.SslOnConnect,
+        _ => throw new ArgumentOutOfRangeException(nameof(Transport)),
+    };
+
+    /// <summary>
+    /// A client that trusts the test certificate. MailKit takes the callback per instance, unlike
+    /// ServicePointManager, which matters because xunit runs these classes in parallel.
+    /// </summary>
+    public SmtpClient CreateClient() => new()
+    {
+        ServerCertificateValidationCallback = (_, _, _, _) => true,
+        Timeout = 15000,
+    };
+
+    public async Task SendAsync(MailMessage message, NetworkCredential? credentials = null)
+    {
+        using var client = CreateClient();
+        await client.ConnectAsync("127.0.0.1", Port, SocketOptions);
+
+        if (credentials is not null)
+        {
+            await client.AuthenticateAsync(credentials.UserName, credentials.Password);
+        }
+
+        await client.SendAsync(MimeMessage.CreateFromMailMessage(message));
+        await client.DisconnectAsync(quit: true);
+    }
+
+    /// <summary>
+    /// What the server advertises in the very first EHLO, before any TLS upgrade. Used to prove
+    /// that AUTH is not on offer across an unencrypted connection.
+    /// </summary>
+    public async Task<SmtpCapabilities> CapabilitiesBeforeUpgradeAsync()
+    {
+        using var client = CreateClient();
+        await client.ConnectAsync("127.0.0.1", Port, SecureSocketOptions.None);
+
+        var capabilities = client.Capabilities;
+
+        await client.DisconnectAsync(quit: true);
+        return capabilities;
     }
 
     /// <summary>Waits for the one .eml file the test expects and returns its path.</summary>
@@ -108,6 +209,30 @@ internal sealed class TestSink : IAsyncDisposable
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
+    }
+
+    /// <summary>
+    /// StartAsync returns once the hosted service has been started, not once it is accepting, and
+    /// a TLS handshake widens that gap. Probing the socket keeps the first test connection from
+    /// racing the listener.
+    /// </summary>
+    private static async Task WaitUntilListeningAsync(int port)
+    {
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            try
+            {
+                using var probe = new TcpClient();
+                await probe.ConnectAsync(IPAddress.Loopback, port);
+                return;
+            }
+            catch (SocketException)
+            {
+                await Task.Delay(50);
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"The sink never started listening on port {port}.");
     }
 
     public async ValueTask DisposeAsync()

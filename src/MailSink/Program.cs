@@ -12,6 +12,6 @@ builder.Configuration.ResolveKeyVaultReferences(
     allowDeveloperCredentials: builder.Environment.IsDevelopment());
 
 builder.Services.AddWindowsService(options => options.ServiceName = "mail sink");
-builder.Services.AddMailSink(builder.Configuration);
+builder.Services.AddMailSink(builder.Configuration, builder.Environment);
 
 builder.Build().Run();

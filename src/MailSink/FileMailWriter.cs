@@ -8,11 +8,18 @@ public sealed class FileMailWriter : IMailWriter
     /// <summary>Give up rather than spin forever if something keeps taking the names we pick.</summary>
     private const int MaxNameAttempts = 1000;
 
+    /// <summary>Windows paths are case-insensitive, so a containment check must be too -- there.</summary>
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
     private readonly string _root;
+    private readonly string _rootPrefix;
 
     public FileMailWriter(IOptions<MailSinkOptions> options, IHostEnvironment environment)
     {
         _root = Path.GetFullPath(options.Value.MailDirectory, environment.ContentRootPath);
+        _rootPrefix = Path.TrimEndingDirectorySeparator(_root) + Path.DirectorySeparatorChar;
         Directory.CreateDirectory(_root);
     }
 
@@ -20,7 +27,10 @@ public sealed class FileMailWriter : IMailWriter
 
     public async Task<string> WriteAsync(MailName name, byte[] raw, CancellationToken cancellationToken)
     {
-        var directory = string.IsNullOrEmpty(name.Folder) ? _root : Path.Combine(_root, name.Folder);
+        var directory = string.IsNullOrEmpty(name.Folder)
+            ? _root
+            : EnsureUnderRoot(Path.Combine(_root, name.Folder));
+
         Directory.CreateDirectory(directory);
 
         // A burst of mail can share the same millisecond, and two sessions can race for the same
@@ -29,7 +39,8 @@ public sealed class FileMailWriter : IMailWriter
         // the name is free and one silently overwrites the other's message.
         for (var attempt = 1; attempt <= MaxNameAttempts; attempt++)
         {
-            var path = Path.Combine(directory, (attempt == 1 ? name : name.WithAttempt(attempt)).FileName);
+            var path = EnsureUnderRoot(
+                Path.Combine(directory, (attempt == 1 ? name : name.WithAttempt(attempt)).FileName));
 
             FileStream file;
             try
@@ -58,5 +69,23 @@ public sealed class FileMailWriter : IMailWriter
         }
 
         throw new IOException($"Could not find a free file name for '{name.RelativePath}' in '{directory}'.");
+    }
+
+    /// <summary>
+    /// Resolves a path and refuses it if it left the mail directory. MailNaming already strips
+    /// every separator, so nothing should ever reach this -- which is the point: it is the check
+    /// that has to hold if that sanitising is ever weakened or bypassed.
+    /// </summary>
+    private string EnsureUnderRoot(string path)
+    {
+        var resolved = Path.GetFullPath(path);
+
+        if (!resolved.StartsWith(_rootPrefix, PathComparison))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to write '{resolved}': it resolves outside the mail directory '{_root}'.");
+        }
+
+        return resolved;
     }
 }

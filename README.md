@@ -6,17 +6,27 @@ disk as an `.eml` file. Nothing is relayed, so no mail ever reaches a real mailb
 Double-click an `.eml` to open it in Outlook, Thunderbird, or Windows Mail — attachments, HTML
 body and headers included.
 
+The sink behaves differently depending on the environment it runs in, and this is the one thing
+to understand before anything else:
+
+|              | `Development`        | Anywhere else                                                |
+| ------------ | -------------------- | ------------------------------------------------------------ |
+| Transport    | plain text on `1025` | STARTTLS on `587`, implicit TLS on `465`                     |
+| Credentials  | optional             | **required** — it will not start without them                |
+| Certificate  | none                 | **required**, from Key Vault — it will not start without one |
+| Mail at rest | unencrypted          | unencrypted                                                  |
+
+Running it locally therefore costs no configuration, and deploying it cannot accidentally reuse
+that convenience: outside `Development` a missing certificate, a missing credential pair, or a
+configured plain-text port each stop the host at startup.
+
 > [!WARNING]
-> **This is a development tool. Keep it on a trusted network.**
+> **Captured mail is stored unencrypted, in both modes.**
 >
-> It is a deliberately indiscriminate mail server: it accepts mail without authentication, accepts
-> any recipient, speaks plain SMTP with no TLS, and stores every message unencrypted on disk. By
-> default it listens on `0.0.0.0`, so it is reachable from your whole network, not just localhost.
->
-> It cannot be used as an open relay — nothing is ever forwarded — but anything it captures is
-> readable by anyone who can reach the host or its storage, and any SMTP credentials your app sends
-> cross the network in the clear. Point test systems at it, not production ones, and set
-> `MailSink:ListenAddress` to `127.0.0.1` if you only need it locally.
+> The sink protects the connection and the credentials, not the mailbox. Anything it captures is
+> readable by anyone who can reach the host or the storage behind it, so treat the mail directory —
+> and the Azure Files share behind it — as the boundary that actually matters. It accepts any
+> recipient, and it cannot be used as an open relay, because nothing is ever forwarded.
 >
 > See [SECURITY.md](SECURITY.md) for what is deliberate and what is worth reporting.
 
@@ -26,100 +36,142 @@ body and headers included.
 dotnet run --project src/MailSink
 ```
 
-The SMTP listener binds to `0.0.0.0:1025` and writes to `src/MailSink/mail/<yyyy-MM-dd>/`.
+`dotnet run` puts the host in the `Development` environment, so the listener binds to
+`0.0.0.0:1025` in plain text, takes mail from anyone, and writes to
+`src/MailSink/mail/<yyyy-MM-dd>/`. Set `MailSink:ListenAddress` to `127.0.0.1` if you only need it
+on your own machine.
 
 ## Point an app at it
+
+Locally:
 
 | Setting | Value                                                      |
 | ------- | ---------------------------------------------------------- |
 | Host    | `localhost` (or the machine's IP / `host.docker.internal`) |
 | Port    | `1025`                                                     |
 | SSL/TLS | off                                                        |
-| Auth    | none needed; any username/password is accepted             |
+| Auth    | none                                                       |
 
-Set `MailSink:Username` and `MailSink:Password` if you want the sink to insist on one specific
-pair — see [Authentication](#authentication).
+Against a deployed sink:
 
-In ASP.NET Core:
+| Setting | Value                                                            |
+| ------- | ---------------------------------------------------------------- |
+| Host    | the name on the certificate — not an IP, or validation will fail |
+| Port    | `587` for STARTTLS, `465` for implicit TLS                       |
+| SSL/TLS | required; TLS 1.2 or 1.3                                         |
+| Auth    | required, and only offered once the connection is encrypted      |
+
+In ASP.NET Core, locally and then deployed:
 
 ```json
 "Smtp": { "Host": "localhost", "Port": 1025, "EnableSsl": false }
+"Smtp": { "Host": "mailsink.example.test", "Port": 587, "EnableSsl": true }
 ```
+
+`System.Net.Mail`'s `EnableSsl` means STARTTLS, so it can reach port 587 but not 465. A client that
+needs implicit TLS — or a per-connection certificate callback — wants
+[MailKit](https://github.com/jstedfast/MailKit), which is what the tests here use.
 
 ## File names
 
 ```text
 mail/2026-09-21/100137-883_gijs@example.test_Order-1234-confirmed.eml
-      │          │          │                 └── subject, slugged and capped at 60 chars
+      │          │          │                 └── subject, slugged and capped at 60 bytes
       │          │          └── first envelope recipient
       │          └── time received (HHmmss-fff)
       └── date received
 ```
 
 A subject that cannot be parsed is simply left out of the name; the message is still stored byte
-for byte.
+for byte. Path separators, reserved characters, and control and format characters are replaced
+with `-`, so a crafted subject cannot steer the write or smuggle an escape sequence into a log
+line. The cap is counted in UTF-8 bytes, not characters, which keeps a subject of emoji inside the
+255-byte limit Linux puts on a file name.
 
 ## Configuration
 
 Set in `src/MailSink/appsettings.json`, or override with environment variables using the
 `MailSink__` prefix (e.g. `MailSink__Ports__0=25`).
 
-| Key                     | Default     | Meaning                                              |
-| ----------------------- | ----------- | ---------------------------------------------------- |
-| `MailDirectory`         | `mail`      | Where `.eml` files go. Relative to the content root. |
-| `ServerName`            | `mail-sink` | Name reported in the SMTP greeting.                  |
-| `ListenAddress`         | `0.0.0.0`   | Bind address. Use `127.0.0.1` to keep it local-only. |
-| `Ports`                 | `[1025]`    | Ports to listen on. Port 25 is privileged on Linux.  |
-| `MaxMessageSize`        | `26214400`  | Bytes. Larger messages are rejected with 552.        |
-| `AllowAnyCredentials`   | `true`      | Advertise AUTH and accept any credentials.           |
-| `Username`              | *(empty)*   | Require this exact username. Empty accepts any.      |
-| `Password`              | *(empty)*   | Password for `Username`. Required once it is set.    |
-| `RequireAuthentication` | `false`     | Refuse `MAIL FROM` until the session has AUTHed.     |
-| `MaxConcurrentSessions` | `64`        | Connections served at once; `0` removes the limit.   |
-| `GroupByDate`           | `true`      | Write into a `yyyy-MM-dd` subfolder per day.         |
+| Key                          | Default     | Meaning                                                         |
+| ---------------------------- | ----------- | --------------------------------------------------------------- |
+| `MailDirectory`              | `mail`      | Where `.eml` files go. Relative to the content root.            |
+| `ServerName`                 | `mail-sink` | Name reported in the SMTP greeting.                             |
+| `ListenAddress`              | `0.0.0.0`   | Bind address. Use `127.0.0.1` to keep it local-only.            |
+| `Ports`                      | `[1025]`    | Plain text. **`Development` only** — a startup error elsewhere. |
+| `StartTlsPorts`              | `[587]`     | Require STARTTLS before AUTH.                                   |
+| `ImplicitTlsPorts`           | `[465]`     | TLS from the first byte.                                        |
+| `MaxMessageSize`             | `26214400`  | Bytes. Larger messages are rejected with 552.                   |
+| `Username`                   | *(empty)*   | Required outside `Development`.                                 |
+| `Password`                   | *(empty)*   | Password for `Username`. Required once it is set.               |
+| `Tls:KeyVaultCertificateUri` | *(empty)*   | Key Vault certificate URI. Required outside `Development`.      |
+| `Tls:MinimumProtocol`        | `Tls12`     | `Tls12` (1.2 and 1.3) or `Tls13` (1.3 only).                    |
+| `Tls:RefreshInterval`        | `01:00:00`  | How often a rotated certificate is re-read.                     |
+| `MaxConcurrentSessions`      | `64`        | Connections served at once; `0` removes the limit.              |
+| `MaxSessionsPerClient`       | `8`         | Connections from one address; `0` removes the limit.            |
+| `MaxAuthenticationAttempts`  | `3`         | Failed AUTHs before the session is dropped.                     |
+| `SessionTimeout`             | `00:02:00`  | How long one session may stay open.                             |
+| `CommandWaitTimeout`         | `00:01:00`  | How long to wait for the next command.                          |
+| `GroupByDate`                | `true`      | Write into a `yyyy-MM-dd` subfolder per day.                    |
+
+The three port lists are the one place the defaults do not live in `appsettings.json`: the
+configuration binder appends to array defaults instead of replacing them, so a value there would
+be added to whatever you configure rather than superseded by it.
 
 `MaxConcurrentSessions` is what bounds memory: each in-flight message is held whole, up to
 `MaxMessageSize`. Connections beyond the limit are dropped until one finishes.
+`MaxSessionsPerClient` keeps one host from taking that whole budget and starving everyone else.
 
-## Authentication
+## Authentication and TLS
 
-Three modes, chosen by configuration:
-
-| Configuration                                  | Behaviour                                            |
-| ---------------------------------------------- | ---------------------------------------------------- |
-| *(default)* `AllowAnyCredentials: true`        | AUTH advertised, any username/password accepted.     |
-| `Username` + `Password` set                    | AUTH advertised, only that pair accepted.            |
-| `AllowAnyCredentials: false`, no `Username`    | AUTH not advertised, no authenticator registered.    |
+Configuring a credential pair makes AUTH mandatory:
 
 ```json
-"MailSink": { "Username": "app", "Password": "s3cret", "RequireAuthentication": true }
+"MailSink": { "Username": "app", "Password": "s3cret" }
 ```
 
-Or as environment variables: `MailSink__Username=app`, `MailSink__Password=s3cret`.
+Or as environment variables: `MailSink__Username=app`, `MailSink__Password=s3cret`. A `Username`
+without a `Password`, or the other way round, fails at startup rather than quietly going
+unenforced. Outside `Development` the pair is not optional at all.
 
-Setting `Username` wins over `AllowAnyCredentials` — the explicit pair is the more specific
-instruction, so it is not silently cancelled by the flag. A `Username` without a `Password` (or
-the other way round) fails at startup rather than quietly going unenforced.
+There is no accept-anything mode and no separate switch to make the credentials bite. With a pair
+configured, `MAIL FROM` is answered `530` until the session has authenticated. Without one — only
+possible in `Development` — no authenticator is registered at all, so there is nothing that could
+accept a wrong password in the first place.
 
-**`RequireAuthentication` is the switch that makes credentials bite.** With it off — the default —
-a wrong pair gets `535`, but the session simply carries on and delivers the message
-unauthenticated, because a sink should not silently drop mail. Turn it on and `MAIL FROM` is
-answered with `530 authentication required` until the session has authenticated, which is what
-lets a test prove an application really does send the credentials it was configured with.
+**AUTH is only ever offered across an encrypted connection.** On a STARTTLS port it is absent from
+the first `EHLO` and appears in the second, after the upgrade. Together with that `530`, this
+means a session which skips STARTTLS has no route to a delivered message, and credentials cannot
+cross the wire in the clear even from a client that would have been willing to send them. Nothing
+below TLS 1.2 is offered, and `Tls:MinimumProtocol: Tls13` narrows it further.
 
-The credentials are not a security boundary. There is no TLS, so AUTH LOGIN/PLAIN sends them
-base64-encoded over a plain socket; treat them as a wiring check on a trusted network, not as
-protection. Don't reuse a real password here.
+Three failed AUTHs drop the session (`MaxAuthenticationAttempts`), and each one is logged at
+warning with the username and the client address, so a run of them is something a SIEM can alert
+on. The password never reaches the log.
+
+### Where the certificate comes from
+
+A Key Vault certificate:
+
+```text
+MailSink__Tls__KeyVaultCertificateUri=https://<vault>.vault.azure.net/certificates/mailsink-smtp
+```
+
+Leave the version off, as above, and a rotation is picked up within `Tls:RefreshInterval` without
+a restart. The private key is read through the secret that backs the certificate — a Key Vault
+certificate object is only the public half — so the sink's identity needs both
+`Key Vault Certificate User` and `Key Vault Secrets User`. [deploy.ps1](deploy/deploy.ps1) grants
+both, and `MailSink:KeyVault:AllowedHosts` constrains which vault the URI may point at.
 
 ### Where the password comes from
 
 Never `appsettings.json` — that file is committed. There are two supported places, one per
 environment:
 
-| Environment | Source                      | Set up by                                   |
-| ----------- | --------------------------- | ------------------------------------------- |
-| Local       | `appsettings.local.json`    | You, by hand. Gitignored.                   |
-| Azure       | Key Vault                   | [deploy/deploy.ps1](deploy/deploy.ps1).     |
+| Environment | Source                   | Set up by                               |
+| ----------- | ------------------------ | --------------------------------------- |
+| Local       | `appsettings.local.json` | You, by hand. Gitignored.               |
+| Azure       | Key Vault                | [deploy/deploy.ps1](deploy/deploy.ps1). |
 
 **Local.** Copy the example and edit it:
 
@@ -155,10 +207,17 @@ never builds a credential chain or looks for a managed identity that isn't there
 docker compose up -d --build
 ```
 
-Mail lands in `./mail` on the host. The published port is bound to `127.0.0.1` — Docker's port
-publishing bypasses the host firewall, so binding every interface would hand the whole LAN an open
-sink. Change it in [compose.yaml](compose.yaml) if other machines need to reach it. The container
-runs as a non-root user.
+Mail lands in `./mail` on the host. [compose.yaml](compose.yaml) sets
+`DOTNET_ENVIRONMENT=Development`, so this is the plain-text, no-credentials mode — it is the local
+convenience path, not a deployment. The published port is bound to `127.0.0.1` accordingly:
+Docker's port publishing bypasses the host firewall, so binding every interface would hand the
+whole LAN an open sink. The container runs as a non-root user.
+
+To run the deployed posture under Docker instead, drop `DOTNET_ENVIRONMENT`, set
+`MailSink__Tls__KeyVaultCertificateUri` and the credentials, and publish the TLS ports. Note that
+the image listens on `2587` and `2465` rather than `587` and `465`: both of those are privileged,
+and the container deliberately does not run as root, so it listens high and you map the port
+clients should see — `-p 587:2587`.
 
 ## Azure (Container Instances)
 
@@ -199,18 +258,28 @@ container group's ARM definition, or `az container show`. The generated password
 `az keyvault secret set` through a temp file that is deleted immediately, because `--value` would
 put it on a command line.
 
-`-RequireAuthentication` defaults to `$true` for `-Exposure Public` and `$false` for Private. On
-the very first deployment the vault role assignment has to propagate before the sink can read its
-password, so the container may restart a couple of times for a minute or two; the script says so
-when that applies.
+On the very first deployment the vault role assignments have to propagate before the sink can read
+its password and certificate, so the container may restart a couple of times for a minute or two;
+the script says so when that applies.
+
+**Certificate.** The script issues a self-signed certificate into the same vault and grants the
+container's identity the two roles needed to read it. Its subject is the public FQDN for
+`-Exposure Public`, and `<name-prefix>.internal` for Private, where there is no name to use; pass
+`-CertificateSubject` to issue it for whatever your senders will actually connect to. Because it
+is self-signed, senders have to be told to trust it — the script prints the
+`az keyvault certificate download` command for that. Replace the certificate in the vault with one
+from your own CA and the sink picks the replacement up on its next refresh.
+
+**Ports.** `-StartTlsPort` defaults to `2587` and `-ImplicitTlsPort` to `2465`, not the standard
+`587` and `465`, because the container runs as a non-root user that may not bind a privileged
+port and ACI publishes the container's port as-is. Senders therefore need the port in their
+configuration. Front the group with a load balancer if you need the standard numbers.
 
 **Exposure.** The default is `-Exposure Private`: the container group sits in a VNet with no public
 IP, reachable from that VNet, peered networks, or over VPN. `-Exposure Public -DnsLabel <label>`
-gives it an `<label>.<region>.azurecontainer.io` FQDN instead. The sink accepts any recipient, so a
-public endpoint *will* be found by scanners and filled with junk mail. It can't be abused to relay
-— nothing is ever forwarded — but treat public exposure as short-lived. Public exposure therefore
-defaults to `-RequireAuthentication $true`, which keeps the casual scanner out; there is still no
-TLS, so that is a nuisance filter, not a control.
+gives it an `<label>.<region>.azurecontainer.io` FQDN instead. Every session has to authenticate
+over TLS either way, so a public endpoint is no longer an open sink — but it still accepts any
+recipient once authenticated, and it will be found and probed by scanners, so prefer Private.
 
 **Reading the mail.** Map the file share as a drive and double-click the `.eml` files. Keep the key
 in a variable — `net use` would put it on a command line, where it lands in your shell history and
@@ -253,26 +322,37 @@ sc.exe start "mail sink"
 Running as a service means relative paths resolve against the publish folder — set
 `MailSink:MailDirectory` to an absolute path such as `C:\MailSink\mail`.
 
+A service has no `DOTNET_ENVIRONMENT` set, so it runs as `Production` and needs a certificate and
+a credential pair before it will start. It can bind `587` and `465` directly, unlike the
+container, so the defaults are right here. The service account needs to reach Key Vault: give the
+machine a managed identity, or set `MailSink:KeyVault:ManagedIdentityClientId`.
+
 ## Tests
 
 ```powershell
 dotnet test
 ```
 
-`tests/MailSink.Tests` (XUnit) covers five layers:
+`tests/MailSink.Tests` (XUnit) covers six layers:
 
-- **`MailNaming`** — pure function, so file naming is asserted directly: subject cap, non-ASCII,
-  illegal characters, path-separator escaping, collision suffixes.
-- **`MailCapture`** — the capture pipeline against an in-memory `IMailWriter` and a
-  `FakeTimeProvider`, so names are deterministic and the writer-failure path is exercised.
+- **`MailNaming`** — pure function, so file naming is asserted directly: the byte budget, surrogate
+  pairs, control and format characters, culture-independent dates, path-separator escaping,
+  collision suffixes.
+- **`MailCapture`** / **`FileMailWriter`** — the capture pipeline against an in-memory
+  `IMailWriter` and a `FakeTimeProvider`, so names are deterministic and the writer-failure path is
+  exercised; plus that the writer refuses a path resolving outside the mail directory.
+- **`SmtpOptionsFactory`** — that the endpoint wiring matches the environment: which ports open,
+  which are secure, and that every deployed endpoint requires AUTH, refuses it unencrypted, and
+  pins the protocol floor.
 - **`FixedCredentialUserAuthenticator`** — the credential comparison on its own, so the wrong-pair
   cases are asserted without a socket.
 - **Configuration** — that `appsettings.local.json` overrides `appsettings.json` but not the
   environment, and that only a real `@Microsoft.KeyVault(` value is treated as a reference.
-- **`SinkEndToEndTests` / `AuthenticationEndToEndTests`** — boot the real listener on a free port
-  against a temp folder (`TestSink`) and send through `System.Net.Mail.SmtpClient`, then re-parse
-  the resulting `.eml` with MimeKit. The authentication set covers the configured pair, wrong
-  pairs, and `RequireAuthentication`.
+- **End-to-end** — boot the real listener on a free port against a temp folder (`TestSink`), send
+  through MailKit, then re-parse the resulting `.eml` with MimeKit. `TlsEndToEndTests` runs the
+  sink outside `Development`, so it exercises the deployed wiring: a round trip over each port
+  style, AUTH absent from the pre-STARTTLS `EHLO`, a sender that skips STARTTLS getting nowhere,
+  and TLS 1.1 refused. Only the certificate is substituted, since a test cannot reach Key Vault.
 
 The seams that make this possible are `IMailWriter`, `IMailCapture`/`IncomingMessage`,
 `IMessageMetadataReader` and `SmtpOptionsFactory`; `EmlMessageStore` is only an adapter from
@@ -320,6 +400,6 @@ and [MailHog](https://github.com/mailhog/MailHog) do that well. This one deliber
 ## Contributing, security, licence
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) — scope, style, and how to run the tests.
-- [SECURITY.md](SECURITY.md) — what counts as a vulnerability here (several alarming-looking
-  properties are deliberate) and how to report one privately.
+- [SECURITY.md](SECURITY.md) — the posture in each environment, what counts as a vulnerability,
+  and how to report one privately.
 - [MIT](LICENSE).
