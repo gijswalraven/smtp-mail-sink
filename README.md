@@ -100,35 +100,35 @@ line. The cap is counted in UTF-8 bytes, not characters, which keeps a subject o
 Set in `src/MailSink/appsettings.json`, or override with environment variables using the
 `MailSink__` prefix (e.g. `MailSink__Ports__0=25`).
 
-| Key                          | Default     | Meaning                                                         |
-| ---------------------------- | ----------- | --------------------------------------------------------------- |
-| `MailDirectory`              | `mail`      | Where `.eml` files go. Relative to the content root. Ignored once `Blob:ServiceUri` is set. |
-| `ServerName`                 | `mail-sink` | Name reported in the SMTP greeting.                             |
-| `ListenAddress`              | `127.0.0.1` | Bind address. A container needs `0.0.0.0` to be reachable.      |
-| `AllowPlainTextFromAnyAddress` | `false`   | Lets an unencrypted listener bind something other than loopback. |
-| `Port`                       | `0`         | The one port to listen on. `0` takes the conventional port for `TlsMode`. |
-| `TlsMode`                    | `StartTls`  | `StartTls` (587), `Implicit` (465), or `None` (1025, **`Development` only**). |
-| `MaxMessageSize`             | `10485760`  | Bytes. Larger messages are rejected with 552.                   |
-| `Username`                   | *(empty)*   | Single client. Required outside `Development` unless `Accounts` is set. |
-| `Password`                   | *(empty)*   | Password for `Username`. Required once it is set.               |
-| `Accounts:<name>:Username`   | *(none)*    | Several clients. One credential pair and one folder per account. |
-| `Accounts:<name>:Password`   | *(none)*    | Password for that account. Required.                            |
-| `Accounts:<name>:Folder`     | *(the name)* | Folder — or blob container — its mail goes to.                |
-| `Tls:KeyVaultCertificateUri` | *(empty)*   | Key Vault certificate URI. Required outside `Development`.      |
-| `Tls:MinimumProtocol`        | `Tls12`     | `Tls12` (1.2 and 1.3) or `Tls13` (1.3 only).                    |
-| `Tls:RefreshInterval`        | `01:00:00`  | How often a rotated certificate is re-read.                     |
-| `Blob:ServiceUri`            | *(empty)*   | Write to this Azure storage account instead of the filesystem.  |
-| `Blob:Container`             | `mail`      | Container for mail that belongs to no account.                  |
-| `Blob:ManagedIdentityClientId` | *(empty)* | Which user-assigned identity to authenticate with.             |
-| `MaxConcurrentSessions`      | `64`        | Connections served at once; `0` removes the limit.              |
-| `MaxSessionsPerClient`       | `8`         | Connections from one address; `0` removes the limit.            |
-| `MaxAuthenticationAttempts`  | `3`         | Failed AUTHs before the session is dropped.                     |
-| `SessionTimeout`             | `00:02:00`  | How long one session may stay open.                             |
-| `CommandWaitTimeout`         | `00:01:00`  | How long to wait for the next command.                          |
-| `HealthPort`                 | `8080`      | HTTP health endpoint; `0` disables it.                          |
-| `GroupByDate`                | `true`      | Write into a `yyyy-MM-dd` subfolder per day.                    |
-| `Retention:MaxAge`           | `00:00:00`  | Delete `.eml` files older than this; `0` keeps them forever.    |
-| `Retention:SweepInterval`    | `01:00:00`  | How often the destination is swept.                             |
+| Key                            | Default      | Meaning                                                                                     |
+| ------------------------------ | ------------ | ------------------------------------------------------------------------------------------- |
+| `MailDirectory`                | `mail`       | Where `.eml` files go. Relative to the content root. Ignored once `Blob:ServiceUri` is set. |
+| `ServerName`                   | `mail-sink`  | Name reported in the SMTP greeting.                                                         |
+| `ListenAddress`                | `127.0.0.1`  | Bind address. A container needs `0.0.0.0` to be reachable.                                  |
+| `AllowPlainTextFromAnyAddress` | `false`      | Lets an unencrypted listener bind something other than loopback.                            |
+| `Port`                         | `0`          | The one port to listen on. `0` takes the conventional port for `TlsMode`.                   |
+| `TlsMode`                      | `StartTls`   | `StartTls` (587), `Implicit` (465), or `None` (1025, **`Development` only**).               |
+| `MaxMessageSize`               | `10485760`   | Bytes. Larger messages are rejected with 552.                                               |
+| `Username`                     | *(empty)*    | Single client. Required outside `Development` unless `Accounts` is set.                     |
+| `Password`                     | *(empty)*    | Password for `Username`. Required once it is set.                                           |
+| `Accounts:<name>:Username`     | *(none)*     | Several clients. One credential pair and one folder per account.                            |
+| `Accounts:<name>:Password`     | *(none)*     | Password for that account. Required.                                                        |
+| `Accounts:<name>:Folder`       | *(the name)* | Folder — or blob container — its mail goes to.                                              |
+| `Tls:KeyVaultCertificateUri`   | *(empty)*    | Key Vault certificate URI. Required outside `Development`.                                  |
+| `Tls:MinimumProtocol`          | `Tls12`      | `Tls12` (1.2 and 1.3) or `Tls13` (1.3 only).                                                |
+| `Tls:RefreshInterval`          | `01:00:00`   | How often a rotated certificate is re-read.                                                 |
+| `Blob:ServiceUri`              | *(empty)*    | Write to this Azure storage account instead of the filesystem.                              |
+| `Blob:Container`               | `mail`       | Container for mail that belongs to no account.                                              |
+| `Blob:ManagedIdentityClientId` | *(empty)*    | Which user-assigned identity to authenticate with.                                          |
+| `MaxConcurrentSessions`        | `64`         | Connections served at once; `0` removes the limit.                                          |
+| `MaxSessionsPerClient`         | `8`          | Connections from one address; `0` removes the limit.                                        |
+| `MaxAuthenticationAttempts`    | `3`          | Failed AUTHs before the session is dropped.                                                 |
+| `SessionTimeout`               | `00:02:00`   | How long one session may stay open.                                                         |
+| `CommandWaitTimeout`           | `00:01:00`   | How long to wait for the next command.                                                      |
+| `HealthPort`                   | `8080`       | HTTP health endpoint; `0` disables it.                                                      |
+| `GroupByDate`                  | `true`       | Write into a `yyyy-MM-dd` subfolder per day.                                                |
+| `Retention:MaxAge`             | `00:00:00`   | Delete `.eml` files older than this; `0` keeps them forever.                                |
+| `Retention:SweepInterval`      | `01:00:00`   | How often the destination is swept.                                                         |
 
 The three port lists are the one place the defaults do not live in `appsettings.json`: the
 configuration binder appends to array defaults instead of replacing them, so a value there would
@@ -228,6 +228,11 @@ certificate object is only the public half — so the sink's identity needs both
 both, and `MailSink:KeyVault:AllowedHosts` constrains which vault the URI may point at.
 
 ### Where the password comes from
+
+Passwords are stored as readable secrets, not as hashes — deliberately, because the same password
+has to be handed to whoever configures the sending application, and a hash cannot be read back out
+for that. What protects them is where they are kept, so keep them out of anything committed.
+[SECURITY.md](SECURITY.md) has the reasoning.
 
 Never `appsettings.json` — that file is committed. There are two supported places, one per
 environment:

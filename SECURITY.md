@@ -19,6 +19,7 @@ What the sink still does by design:
 
 - accepts any recipient address — it is a sink, not a router, and nothing is ever forwarded,
 - stores every message unencrypted on disk, headers and body included,
+- holds each account's password in Key Vault as a readable secret rather than as a hash,
 - in the `Development` environment **only**, listens in plain text and, unless credentials are
   configured, accepts mail from anyone. This is what keeps a local run zero-configuration.
 
@@ -32,6 +33,15 @@ directory can read all of it. In Azure they are, because there each account writ
 container of its own and a container is the smallest scope an Entra ID role assignment takes: a
 `Storage Blob Data Reader` grant on `orders` reads the orders mail and nothing else.
 
+Passwords being readable is a choice rather than an oversight. Hashing them would work for the
+comparison itself — a client sends the password at AUTH, so a hash would verify it perfectly well
+— but the same password has to be handed to whoever configures the sending application, and a
+hash cannot be read back out for that. So the protection is the vault, not the storage format:
+reading a password is an Entra ID role assignment on the vault, the container reads its own
+credentials through a managed identity, and the secret never reaches a command line, the
+container group's ARM definition, or `az container show`. Anyone who can read the vault can read
+the passwords, and that is the access to control.
+
 The unencrypted store is the part to plan around. Anything the sink captures is readable by anyone
 who can reach the host or the storage behind it — the transport and the credentials are protected,
 the mail at rest is not. Treat the mail directory, and the blob container behind it, as the
@@ -44,8 +54,8 @@ account key to leak, no key to hand to a person, and every read is attributable 
 logs. A deployment that predates this still has an Azure Files share with mail on it; `deploy.ps1`
 will not disable the key while that share exists, because SMB cannot be reached without it.
 
-Reports that amount to "the Development mode accepts any password" or "stored messages are not
-encrypted" will be closed with a pointer to this page.
+Reports that amount to "the Development mode accepts any password", "stored messages are not
+encrypted", or "the SMTP passwords are not hashed" will be closed with a pointer to this page.
 
 ## What is a vulnerability
 
@@ -67,8 +77,9 @@ Report it if you find a way to:
 - execute code in the sink process by sending it a message,
 - crash or wedge the process with a single message or a small number of connections, beyond the
   configured `MaxMessageSize` and session limits,
-- recover a configured password, or the certificate's private key, from a log, a file name, or a
-  stored message,
+- recover a configured password, or the certificate's private key, without a role assignment on
+  the vault holding it: from a log, a file name, a stored message, an SMTP reply, or anything the
+  deployment scripts leave on a command line or in the container group's definition,
 - read or write captured mail in Azure without a role assignment on the blob container holding it:
   obtain a storage account key from anything the deployment scripts do, get the container group to
   accept a key or a SAS token in its configuration, reach a container as any identity other than
