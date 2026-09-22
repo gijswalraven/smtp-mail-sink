@@ -58,6 +58,7 @@ public static class MailSinkServiceCollectionExtensions
 
         services.AddHostedService<SmtpListenerService>();
         services.AddHostedService<HealthEndpointService>();
+        services.AddHostedService<MailRetentionService>();
 
         return services;
     }

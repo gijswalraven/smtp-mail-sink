@@ -18,7 +18,7 @@ public sealed class FileMailWriter : IMailWriter
 
     public FileMailWriter(IOptions<MailSinkOptions> options, IHostEnvironment environment)
     {
-        _root = Path.GetFullPath(options.Value.MailDirectory, environment.ContentRootPath);
+        _root = options.Value.ResolveMailDirectory(environment.ContentRootPath);
         _rootPrefix = Path.TrimEndingDirectorySeparator(_root) + Path.DirectorySeparatorChar;
         Directory.CreateDirectory(_root);
     }

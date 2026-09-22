@@ -114,6 +114,8 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `CommandWaitTimeout`         | `00:01:00`  | How long to wait for the next command.                          |
 | `HealthPort`                 | `8080`      | HTTP health endpoint; `0` disables it.                          |
 | `GroupByDate`                | `true`      | Write into a `yyyy-MM-dd` subfolder per day.                    |
+| `Retention:MaxAge`           | `00:00:00`  | Delete `.eml` files older than this; `0` keeps them forever.    |
+| `Retention:SweepInterval`    | `01:00:00`  | How often the mail directory is swept.                          |
 
 The three port lists are the one place the defaults do not live in `appsettings.json`: the
 configuration binder appends to array defaults instead of replacing them, so a value there would
@@ -321,8 +323,7 @@ creates, re-run with `-UseAdminCredentials` and it will use the registry admin a
 Neither the storage key nor the registry password is written to disk; both are read into a variable
 at run time and dropped afterwards. They are passed as arguments to the single `az container create`
 call, because ARM has to receive them and az offers no environment-variable equivalent — so command
-lines are readable by other local users on a shared deploy machine. The purge script below avoids
-this entirely, which matters more there because its scheduled task re-runs unattended every hour.
+lines are readable by other local users on a shared deploy machine.
 
 **Timezone.** A Linux container runs in UTC, which would make the date folders and timestamps UTC
 too. The script sets `TZ=Europe/Amsterdam`; override it with `-TimeZone`.
@@ -349,7 +350,7 @@ machine a managed identity, or set `MailSink:KeyVault:ManagedIdentityClientId`.
 dotnet test
 ```
 
-`tests/MailSink.Tests` (XUnit) covers six layers:
+`tests/MailSink.Tests` (XUnit) covers seven layers:
 
 - **`MailNaming`** — pure function, so file naming is asserted directly: the byte budget, surrogate
   pairs, control and format characters, culture-independent dates, path-separator escaping,
@@ -362,6 +363,9 @@ dotnet test
   pins the protocol floor.
 - **`FixedCredentialUserAuthenticator`** — the credential comparison on its own, so the wrong-pair
   cases are asserted without a socket.
+- **`MailRetentionService`** — a sweep over a real temp folder with a `FakeTimeProvider`: what
+  goes at the age boundary, that a non-`.eml` file and an emptied account folder stay, and that
+  advancing the clock past the interval sweeps again.
 - **Configuration** — that `appsettings.local.json` overrides `appsettings.json` but not the
   environment, and that only a real `@Microsoft.KeyVault(` value is treated as a reference.
 - **End-to-end** — boot the real listener on a free port against a temp folder (`TestSink`), send
@@ -376,36 +380,35 @@ SmtpServer's types onto them.
 
 ## Retention
 
-The sink never deletes anything by itself. [deploy/purge-old-mail.ps1](deploy/purge-old-mail.ps1)
-removes `.eml` files older than a given age from a local folder, from the Azure Files share, or
-both, and drops the date folders once they are empty.
+The sink deletes its own mail. Set `MailSink:Retention:MaxAge` and a background sweeper removes
+`.eml` files older than that and drops the folders they leave empty. The default is `0`, which
+keeps everything forever — nothing is deleted until you ask for it.
 
-```powershell
-# See what would go, without touching anything
-./deploy/purge-old-mail.ps1 -Path src/MailSink/mail -WhatIf
-
-# Purge locally and in Azure, anything older than 24 hours
-./deploy/purge-old-mail.ps1 -Path src/MailSink/mail `
-    -ResourceGroup rg-mailsink -StorageAccount <storage>
+```json
+"MailSink": {
+  "Retention": {
+    "MaxAge": "7.00:00:00",
+    "SweepInterval": "01:00:00"
+  }
+}
 ```
 
-Make it automatic by registering a scheduled task that runs the same arguments every hour:
+A sweep runs at startup and then every `SweepInterval`, so a sink that was off over the weekend
+clears what expired while it was down rather than waiting an hour first. Age is the file's last
+write time, which is what a directory listing shows, rather than the timestamp in its name — that
+one can be switched off entirely with `GroupByDate`.
+
+In Azure it covers the file share too, because the share is what `MailSink:MailDirectory` points at
+inside the container. There is nothing to schedule and no storage key to hand out:
 
 ```powershell
-./deploy/purge-old-mail.ps1 -Path src/MailSink/mail `
-    -ResourceGroup rg-mailsink -StorageAccount <storage> -Install
+./deploy/deploy.ps1 -RetentionHours 168
 ```
 
-Remove it again with `Unregister-ScheduledTask -TaskName 'mail-sink purge' -Confirm:$false`.
-
-| Parameter         | Default | Notes                                                       |
-| ----------------- | ------- | ----------------------------------------------------------- |
-| `-OlderThanHours` | `24`    | `0` deletes everything currently stored.                    |
-| `-RunEveryHours`  | `1`     | Repetition interval used by `-Install`.                     |
-| `-WhatIf`         |         | Lists every file that would be deleted and deletes nothing. |
-
-The storage key is fetched from `az` on each run and handed to it through `AZURE_STORAGE_KEY`, so
-nothing secret is stored in the task and nothing appears on a command line.
+What the sweeper leaves alone: the mail directory itself, every folder an account writes to (an
+empty one means that account has had no mail), and anything that is not a `.eml` file. A file it
+cannot delete — one still being written, or a share that went away for a moment — is logged and
+tried again on the next sweep.
 
 ## Alternatives
 

@@ -55,6 +55,11 @@
     Senders must therefore trust it explicitly. Replace it in the key vault with one from your own
     CA to avoid that, and the sink will pick the replacement up on its next restart.
 
+.PARAMETER RetentionHours
+    How long the sink keeps a captured message before deleting it. 0, the default, keeps
+    everything: the share then grows until someone empties it. The sink does the deleting itself,
+    on the mounted share, so nothing outside the container has to run on a schedule.
+
 .PARAMETER UseAdminCredentials
     Pull the image with the registry's admin username/password instead of the managed identity.
     Microsoft's docs list a Premium registry as a prerequisite for managed-identity pulls; if the
@@ -101,6 +106,12 @@ param(
 
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,
+
+    # 0 keeps captured mail forever. Anything else has the sink delete its own .eml files off the
+    # share once they reach that age. A year is the ceiling only because a longer one is far more
+    # likely to be a typo than a wish.
+    [ValidateRange(0, 8760)]
+    [int]$RetentionHours = 0,
 
     [string]$TimeZone = 'Europe/Amsterdam',
     [string]$Cpu = '0.5',
@@ -650,6 +661,8 @@ $environment = [ordered]@{
     'MailSink__ImplicitTlsPorts__0'               = "$ImplicitTlsPort"
     # Not published, so it is reachable by the probe and not by a sender.
     'MailSink__HealthPort'                        = "$HealthPort"
+    # The sink sweeps the mounted share itself; 0 means it deletes nothing.
+    'MailSink__Retention__MaxAge'                 = ([timespan]::FromHours($RetentionHours)).ToString()
     'TZ'                                          = $TimeZone
     'MailSink__Username'                          = $usernameReference
     'MailSink__Password'                          = $passwordReference
@@ -918,6 +931,10 @@ Write-Host '  Auth      : required, over TLS only'
 Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
 Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
 Write-Host "  Mail share: $storageName/$shareName"
+$retentionSummary = $RetentionHours -eq 0 `
+    ? 'off, mail is kept until you delete it (re-run with -RetentionHours)' `
+    : "$RetentionHours h, swept hourly by the sink itself"
+Write-Host "  Retention : $retentionSummary"
 Write-Host ''
 Write-Host 'The password is in the key vault; the container reads it through its managed identity.'
 Write-Host 'Read it back when you need to configure a sender:'

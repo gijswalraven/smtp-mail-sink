@@ -8,6 +8,14 @@ public sealed class MailSinkOptions
     /// <summary>Folder the .eml files are written to. Relative paths are resolved against the content root.</summary>
     public string MailDirectory { get; set; } = "mail";
 
+    /// <summary>
+    /// <see cref="MailDirectory"/> as an absolute path. The content root rather than the working
+    /// directory, because a Windows service starts in system32 and a relative folder would then be
+    /// created there.
+    /// </summary>
+    public string ResolveMailDirectory(string contentRootPath) =>
+        Path.GetFullPath(MailDirectory, contentRootPath);
+
     /// <summary>Name the server reports in its SMTP greeting, and the name a certificate should cover.</summary>
     public string ServerName { get; set; } = "mail-sink";
 
@@ -55,6 +63,9 @@ public sealed class MailSinkOptions
 
     /// <summary>TLS settings. Required outside Development.</summary>
     public TlsOptions Tls { get; set; } = new();
+
+    /// <summary>How long captured mail is kept. Off unless an age is configured.</summary>
+    public RetentionOptions Retention { get; set; } = new();
 
     /// <summary>True when a credential pair is configured, and so when AUTH is advertised.</summary>
     public bool HasCredentials => !string.IsNullOrEmpty(Username);
@@ -118,6 +129,8 @@ public sealed class MailSinkOptions
                 "MailSink:Password is set without MailSink:Username, so nothing would enforce it.");
         }
 
+        ValidateRetention();
+
         if (isDevelopment)
         {
             return;
@@ -144,6 +157,28 @@ public sealed class MailSinkOptions
             throw new InvalidOperationException(
                 "MailSink:Ports configures a plain-text listener and is only allowed in the " +
                 "Development environment. Use MailSink:StartTlsPorts or MailSink:ImplicitTlsPorts.");
+        }
+    }
+
+    /// <summary>
+    /// Keeps retention from being configured into something that does nothing or spins. Deleting
+    /// mail is the one thing here that cannot be undone, so a value that does not say what it
+    /// looks like it says is worth refusing to start over.
+    /// </summary>
+    private void ValidateRetention()
+    {
+        if (Retention.MaxAge < TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:Retention:MaxAge is negative, which would delete every message as " +
+                "soon as it arrived. Use 0 to keep mail forever.");
+        }
+
+        if (Retention.IsEnabled && Retention.SweepInterval <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:Retention:SweepInterval has to be positive; an interval of zero " +
+                "would sweep the mail directory in a loop.");
         }
     }
 }
