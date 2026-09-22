@@ -32,6 +32,13 @@ public readonly record struct MailName(string Account, string Date, string FileN
 
     public string RelativePath => string.Join('/', Folders.Append(FileName));
 
+    /// <summary>
+    /// The part of <see cref="RelativePath"/> below the account: what the name is inside a store
+    /// that already keeps the account apart, as a container per account does.
+    /// </summary>
+    public string PathWithinAccount =>
+        string.IsNullOrEmpty(Date) ? FileName : $"{Date}/{FileName}";
+
     /// <summary>Same name with a numeric suffix, used when the first choice is already taken.</summary>
     public MailName WithAttempt(int attempt) =>
         this with { FileName = $"{Path.GetFileNameWithoutExtension(FileName)}_{attempt}.eml" };
@@ -217,6 +224,47 @@ public static class MailNaming
 
         return Encoding.UTF8.GetByteCount(folder) > MaxFolderBytes
             ? Prefix + $"is longer than the {MaxFolderBytes}-byte limit on a folder name."
+            : null;
+    }
+
+    /// <summary>
+    /// Why <paramref name="name"/> cannot be an Azure Blob Storage container, or null when it can.
+    /// </summary>
+    /// <remarks>
+    /// A second, stricter set of rules than <see cref="DescribeInvalidFolder"/>, applied only when
+    /// mail goes to blob storage, where an account's folder is a container rather than a prefix.
+    /// Azure would refuse the name itself; checking it here means a deployment fails at startup
+    /// with the rule it broke, rather than on the first message with a 400 from the service.
+    /// <para>
+    /// Refused rather than lowercased or padded, like folder names and for the same reason: mail
+    /// stored in a container an operator did not name is worse than a sink that will not start.
+    /// </para>
+    /// </remarks>
+    public static string? DescribeInvalidContainerName(string name)
+    {
+        const string Prefix = "cannot be used as a blob container name: it ";
+
+        if (name.Length is < 3 or > 63)
+        {
+            return Prefix + "is not between 3 and 63 characters, which Azure requires of a container.";
+        }
+
+        foreach (var character in name)
+        {
+            if (character is not ((>= 'a' and <= 'z') or (>= '0' and <= '9') or '-'))
+            {
+                return Prefix + $"contains '{character}'; a container name takes only lower-case " +
+                    "letters, digits and hyphens.";
+            }
+        }
+
+        if (!char.IsAsciiLetterOrDigit(name[0]) || !char.IsAsciiLetterOrDigit(name[^1]))
+        {
+            return Prefix + "starts or ends with a hyphen.";
+        }
+
+        return name.Contains("--", StringComparison.Ordinal)
+            ? Prefix + "has two hyphens in a row."
             : null;
     }
 }

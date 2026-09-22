@@ -17,6 +17,26 @@ public sealed class InMemoryMailWriter : IMailWriter
     /// <summary>When set, WriteAsync throws this instead of storing, to exercise the failure path.</summary>
     public Exception? ThrowOnWrite { get; set; }
 
+    /// <summary>
+    /// What each sweep was asked to delete before, newest last. A snapshot, because the sweeper
+    /// runs on the thread pool and a test reads this while it may be adding to it.
+    /// </summary>
+    public IReadOnlyList<DateTimeOffset> Sweeps
+    {
+        get
+        {
+            lock (_sweeps)
+            {
+                return [.. _sweeps];
+            }
+        }
+    }
+
+    /// <summary>What the next sweep reports having removed.</summary>
+    public SweepResult SweepResult { get; set; }
+
+    private readonly List<DateTimeOffset> _sweeps = [];
+
     public Task<string> WriteAsync(MailName name, byte[] raw, CancellationToken cancellationToken)
     {
         if (ThrowOnWrite is not null)
@@ -26,6 +46,16 @@ public sealed class InMemoryMailWriter : IMailWriter
 
         _written.Add((name, raw));
         return Task.FromResult($"in-memory/{name.RelativePath}");
+    }
+
+    public Task<SweepResult> SweepAsync(DateTimeOffset cutoff, CancellationToken cancellationToken)
+    {
+        lock (_sweeps)
+        {
+            _sweeps.Add(cutoff);
+        }
+
+        return Task.FromResult(SweepResult);
     }
 }
 

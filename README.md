@@ -25,8 +25,9 @@ configured plain-text port each stop the host at startup.
 >
 > The sink protects the connection and the credentials, not the mailbox. Anything it captures is
 > readable by anyone who can reach the host or the storage behind it, so treat the mail directory —
-> and the Azure Files share behind it — as the boundary that actually matters. It accepts any
-> recipient, and it cannot be used as an open relay, because nothing is ever forwarded.
+> and the blob container behind it — as the boundary that actually matters. In Azure that boundary
+> is an Entra ID role on the container, which is the reason there is no storage account key. It
+> accepts any recipient, and it cannot be used as an open relay, because nothing is ever forwarded.
 >
 > See [SECURITY.md](SECURITY.md) for what is deliberate and what is worth reporting.
 
@@ -96,7 +97,7 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 
 | Key                          | Default     | Meaning                                                         |
 | ---------------------------- | ----------- | --------------------------------------------------------------- |
-| `MailDirectory`              | `mail`      | Where `.eml` files go. Relative to the content root.            |
+| `MailDirectory`              | `mail`      | Where `.eml` files go. Relative to the content root. Ignored once `Blob:ServiceUri` is set. |
 | `ServerName`                 | `mail-sink` | Name reported in the SMTP greeting.                             |
 | `ListenAddress`              | `0.0.0.0`   | Bind address. Use `127.0.0.1` to keep it local-only.            |
 | `Ports`                      | `[1025]`    | Plain text. **`Development` only** — a startup error elsewhere. |
@@ -107,10 +108,13 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `Password`                   | *(empty)*   | Password for `Username`. Required once it is set.               |
 | `Accounts:<name>:Username`   | *(none)*    | Several clients. One credential pair and one folder per account. |
 | `Accounts:<name>:Password`   | *(none)*    | Password for that account. Required.                            |
-| `Accounts:<name>:Folder`     | *(the name)* | Folder its mail goes to. Empty writes to the root.             |
+| `Accounts:<name>:Folder`     | *(the name)* | Folder — or blob container — its mail goes to.                |
 | `Tls:KeyVaultCertificateUri` | *(empty)*   | Key Vault certificate URI. Required outside `Development`.      |
 | `Tls:MinimumProtocol`        | `Tls12`     | `Tls12` (1.2 and 1.3) or `Tls13` (1.3 only).                    |
 | `Tls:RefreshInterval`        | `01:00:00`  | How often a rotated certificate is re-read.                     |
+| `Blob:ServiceUri`            | *(empty)*   | Write to this Azure storage account instead of the filesystem.  |
+| `Blob:Container`             | `mail`      | Container for mail that belongs to no account.                  |
+| `Blob:ManagedIdentityClientId` | *(empty)* | Which user-assigned identity to authenticate with.             |
 | `MaxConcurrentSessions`      | `64`        | Connections served at once; `0` removes the limit.              |
 | `MaxSessionsPerClient`       | `8`         | Connections from one address; `0` removes the limit.            |
 | `MaxAuthenticationAttempts`  | `3`         | Failed AUTHs before the session is dropped.                     |
@@ -119,7 +123,7 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `HealthPort`                 | `8080`      | HTTP health endpoint; `0` disables it.                          |
 | `GroupByDate`                | `true`      | Write into a `yyyy-MM-dd` subfolder per day.                    |
 | `Retention:MaxAge`           | `00:00:00`  | Delete `.eml` files older than this; `0` keeps them forever.    |
-| `Retention:SweepInterval`    | `01:00:00`  | How often the mail directory is swept.                          |
+| `Retention:SweepInterval`    | `01:00:00`  | How often the destination is swept.                             |
 
 The three port lists are the one place the defaults do not live in `appsettings.json`: the
 configuration binder appends to array defaults instead of replacing them, so a value there would
@@ -148,7 +152,8 @@ nothing that could accept a wrong password in the first place.
 
 ### Several clients
 
-Give each one an account, and its mail lands in its own folder:
+Give each one an account, and its mail lands in its own folder -- or, in Azure, its own blob
+container:
 
 ```json
 "MailSink": {
@@ -165,6 +170,11 @@ account should not share a name. An empty `Folder` writes to the root of the mai
 which is what a sink that predates accounts already does — so moving an existing `Username` and
 `Password` into an account with `"Folder": ""` changes nothing on disk.
 
+`Folder` is also the name of the blob container the account writes to once `Blob:ServiceUri` is
+set: one setting, so the two destinations cannot be configured to disagree. Container names are
+stricter than folder names, and the sink says which rule a name broke rather than reshaping it —
+see [Azure](#azure-container-instances).
+
 As environment variables, one per line, keyed by the same name:
 
 ```text
@@ -176,12 +186,14 @@ MailSink__Accounts__orders__Folder=orders
 Configuring both `Accounts` and the flat `Username`/`Password` pair is a startup error; so are two
 accounts sharing a username, an account without a password, and a `Folder` that is not a plain
 directory name — anything with a path separator in it, a Windows device name like `con`, a leading
-or trailing space. A folder comes from configuration rather than off the wire, so it is refused
+or trailing space — or, when mail goes to blob storage, one that is not a legal container name. A folder comes from configuration rather than off the wire, so it is refused
 rather than cleaned up: storing mail somewhere other than the name an operator wrote would be
 worse than not starting.
 
-Folders separate output; they are not an access boundary. Nothing reads mail back out over SMTP,
-but anyone who can reach the share sees every account's folder.
+On a filesystem, folders separate output but are not an access boundary: nothing reads mail back
+out over SMTP, but anyone who can reach the mail directory sees every account's folder. In blob
+storage they are a boundary, because each account's folder is a container of its own and a
+container is what an Entra ID role can be scoped to.
 
 Each AUTH attempt is compared against every configured account, with no early exit, so how long a
 rejection takes does not say which usernames exist.
@@ -291,8 +303,8 @@ image binds those directly even though it runs as a non-root user, because conta
 ## Azure (Container Instances)
 
 App Service can't host this — its front ends only accept inbound traffic on 80/443, so an SMTP
-listener is unreachable there. ACI gives you a raw TCP port, and an Azure Files share keeps the
-`.eml` files when the container restarts.
+listener is unreachable there. ACI gives you a raw TCP port, and blob storage keeps the `.eml`
+files when the container restarts.
 
 ```powershell
 ./deploy/deploy.ps1
@@ -308,9 +320,9 @@ happens to be pointed at, it prints the resolved subscription and asks to contin
 runs.
 
 That creates a Basic container registry, builds the image server-side with `az acr build`, creates
-a storage account with a `mail` file share, creates a key vault holding the SMTP credentials, and
-runs the container group with the share mounted at `/mail`. Re-running it targets the same
-resources — names carry a hash of the subscription and resource group.
+a storage account with a blob container per account, creates a key vault holding the SMTP
+credentials, and runs the container group. Re-running it targets the same resources — names carry a
+hash of the subscription and resource group.
 
 **Credentials.** `-SmtpUsername` defaults to `mailsink`. `-SmtpPassword` is generated on the first
 run (32 random alphanumeric characters) and kept in the vault; later runs reuse it rather than
@@ -365,31 +377,69 @@ gives it an `<label>.<region>.azurecontainer.io` FQDN instead. Every session has
 over TLS either way, so a public endpoint is no longer an open sink — but it still accepts any
 recipient once authenticated, and it will be found and probed by scanners, so prefer Private.
 
-**Reading the mail.** Map the file share as a drive and double-click the `.eml` files. Keep the key
-in a variable — `net use` would put it on a command line, where it lands in your shell history and
-is readable by other local users:
+**Where the mail goes, and no storage key.** Captured mail goes to blob storage, written by the
+container group as its own user-assigned managed identity, granted `Storage Blob Data Contributor`
+on the containers it writes to and nothing else. The storage account is created with **shared key
+access disabled**, so the account key stops being a credential that can be leaked, pasted into
+someone's script, or rotated across every holder at once. `MailSink__Blob__ServiceUri` is all the
+container group is given, and it is not a secret: there is no key and no SAS token in its
+definition to read back out of `az container show`.
+
+**A container per account.** Each account writes to a container named after it — `orders`, `crm` —
+and the date stays a blob name prefix, so a message lands at
+`orders/2026-09-21/100137-883_….eml`. The single-client `-SmtpUsername` shape writes to `mail`.
+
+A container, rather than a folder in one shared container, because a container is the smallest
+scope an Entra ID role assignment takes. That is the difference between separation the sink
+arranges and separation the storage account enforces: `Storage Blob Data Reader` on `orders` reads
+the orders mail and nothing else, and it is the only way to express that without
+[ABAC conditions](https://learn.microsoft.com/azure/role-based-access-control/conditions-overview)
+on a prefix.
+
+The price is that an account name has to be a legal container name — 3–63 characters, lower case,
+digits and single hyphens — which is stricter than a folder name. The sink refuses to start on one
+that is not, naming the rule it broke, and `deploy.ps1` holds `-Accounts` to the same set rather
+than quietly mangling a name into shape. A filesystem deployment is unaffected: `Orders` is a
+perfectly good folder.
+
+**Reading the mail.** As yourself, which is the point. The script grants whoever runs it
+`Storage Blob Data Reader` on every container it created, and `--auth-mode login` makes the CLI use
+that instead of a key: every read is a named principal in the storage logs, and access is withdrawn
+by removing a role assignment rather than by rotating a key for everyone at once.
 
 ```powershell
-$key = az storage account keys list -g rg-mailsink --account-name <storage> --query '[0].value' -o tsv
-$cred = [pscredential]::new('localhost\<storage>', (ConvertTo-SecureString $key -AsPlainText -Force))
-New-PSDrive -Name Z -PSProvider FileSystem -Root \\<storage>.file.core.windows.net\mail -Credential $cred
-$key = $null
+az storage blob list --account-name <storage> -c orders --auth-mode login --query '[].name' -o tsv
+az storage blob download-batch --account-name <storage> -s orders --auth-mode login -d .
 ```
 
-**Locking down the share.** The account key is the only thing protecting captured mail, and the
-storage account accepts it from any network by default. `-RestrictStorageNetwork` (Private exposure
-only) puts a service endpoint on the container subnet, allows just that subnet, and sets the
-default action to Deny. You then add your own IP to keep reading the share — the script prints the
-command.
+Storage Explorer and azcopy sign in the same way, and the portal shows a container directly. One
+account's mail can be handed to a colleague without handing over the rest — a role assignment, not
+a credential:
+
+```powershell
+az role assignment create --assignee <them> --role 'Storage Blob Data Reader' --scope <account-id>/blobServices/default/containers/orders
+```
+
+**Locking down the network.** With no key, a role assignment is what protects captured mail, and
+`-RestrictStorageNetwork` (Private exposure only) adds the network to that: a service endpoint on
+the container subnet, only that subnet allowed, default action Deny — so a stolen token has to be
+used from inside the VNet as well. You then add your own IP to keep reading the mail; the script
+prints the command.
+
+**Coming from the Azure Files version.** Earlier deployments mounted a `mail` file share at
+`/mail`. That share is no longer mounted and the mail already on it stays where it is. Azure Files
+cannot be reached without the account key, so while the share exists the script leaves shared key
+access enabled and warns rather than making that mail unreadable. Copy off what is worth keeping,
+delete the share with `az storage share-rm delete`, and re-run: the key is switched off on that
+run. The commands are printed for you.
 
 **Image pull.** The script uses a user-assigned managed identity with `AcrPull` (ACI does not
 support system-assigned identities for registry pulls). Microsoft's documentation lists a Premium
 registry as a prerequisite for that path; if the pull fails against the Basic registry the script
 creates, re-run with `-UseAdminCredentials` and it will use the registry admin account instead.
-Neither the storage key nor the registry password is written to disk; both are read into a variable
-at run time and dropped afterwards. They are passed as arguments to the single `az container create`
-call, because ARM has to receive them and az offers no environment-variable equivalent — so command
-lines are readable by other local users on a shared deploy machine.
+That switch is the one path here with a password in it: it is read into a variable at run time,
+reaches ARM inside the generated container-group file, and is dropped when the call returns. The
+default managed-identity path has no password at all.
 
 **Timezone.** A Linux container runs in UTC, which would make the date folders and timestamps UTC
 too. The script sets `TZ=Europe/Amsterdam`; override it with `-TimeZone`.
@@ -416,14 +466,21 @@ machine a managed identity, or set `MailSink:KeyVault:ManagedIdentityClientId`.
 dotnet test
 ```
 
-`tests/MailSink.Tests` (XUnit) covers seven layers:
+`tests/MailSink.Tests` (XUnit) covers these layers:
 
 - **`MailNaming`** — pure function, so file naming is asserted directly: the byte budget, surrogate
   pairs, control and format characters, culture-independent dates, path-separator escaping,
   collision suffixes.
 - **`MailCapture`** / **`FileMailWriter`** — the capture pipeline against an in-memory
   `IMailWriter` and a `FakeTimeProvider`, so names are deterministic and the writer-failure path is
-  exercised; plus that the writer refuses a path resolving outside the mail directory.
+  exercised; plus that the writer refuses a path resolving outside the mail directory, and the
+  sweep over a real temp folder: what goes at the age boundary, and that a non-`.eml` file and an
+  emptied account folder stay.
+- **`BlobMailWriter`** — what can be asserted without a storage account: the endpoint it will and
+  will not accept (a container, plain HTTP and a SAS token are all refused), the containers it
+  derives from a set of accounts, and that a folder name a filesystem would take but Azure would
+  not — `Orders`, `hr`, `orders--eu` — fails at startup once mail goes to blob storage, and is
+  still perfectly good when it does not.
 - **`SmtpOptionsFactory`** — that the endpoint wiring matches the environment: which ports open,
   which are secure, and that every deployed endpoint requires AUTH, refuses it unencrypted, and
   pins the protocol floor.
@@ -431,9 +488,9 @@ dotnet test
   are asserted without a socket, including one account's username with another's password.
 - **`MailSinkOptions`** — the account rules: duplicate usernames, a missing password, and every
   shape of folder name the filesystem would not take.
-- **`MailRetentionService`** — a sweep over a real temp folder with a `FakeTimeProvider`: what
-  goes at the age boundary, that a non-`.eml` file and an emptied account folder stay, and that
-  advancing the clock past the interval sweeps again.
+- **`MailRetentionService`** — the scheduling, with a `FakeTimeProvider`: a sweep at startup, none
+  at all when no age is configured, and a cutoff that moves with the clock rather than one worked
+  out once when the host started.
 - **Configuration** — that `appsettings.local.json` overrides `appsettings.json` but not the
   environment, and that only a real `@Microsoft.KeyVault(` value is treated as a reference.
 - **End-to-end** — boot the real listener on a free port against a temp folder (`TestSink`), send
@@ -462,21 +519,22 @@ keeps everything forever — nothing is deleted until you ask for it.
 ```
 
 A sweep runs at startup and then every `SweepInterval`, so a sink that was off over the weekend
-clears what expired while it was down rather than waiting an hour first. Age is the file's last
-write time, which is what a directory listing shows, rather than the timestamp in its name — that
-one can be switched off entirely with `GroupByDate`.
+clears what expired while it was down rather than waiting an hour first. Age is the last write
+time, which is what a directory or container listing shows, rather than the timestamp in the name —
+that one can be switched off entirely with `GroupByDate`.
 
-In Azure it covers the file share too, because the share is what `MailSink:MailDirectory` points at
-inside the container. There is nothing to schedule and no storage key to hand out:
+Whoever stores the mail is what expires it, so in Azure the same setting sweeps every container
+the sink writes to, with the container group's own identity. Nothing has to be scheduled, no storage key is handed out,
+and there is no lifecycle rule to keep in step with this setting:
 
 ```powershell
 ./deploy/deploy.ps1 -RetentionHours 168
 ```
 
 What the sweeper leaves alone: the mail directory itself, every folder an account writes to (an
-empty one means that account has had no mail), and anything that is not a `.eml` file. A file it
-cannot delete — one still being written, or a share that went away for a moment — is logged and
-tried again on the next sweep.
+empty one means that account has had no mail), and anything that is not a `.eml` file. A message it
+cannot delete — one still being written, or a destination that was away for a moment — is logged
+and tried again on the next sweep.
 
 ## Supply chain
 

@@ -57,7 +57,7 @@ public sealed class SmtpListenerService(
         };
 
         logger.LogInformation(
-            "mail sink listening on {Address}; {Transport}; auth: {Auth}; writing .eml files to {Destination}",
+            "mail sink listening on {Address}; {Transport}; auth: {Auth}; storing .eml in {Destination}",
             _options.ListenAddress,
             DescribeTransport(_options, isDevelopment),
             DescribeAuthentication(_options),

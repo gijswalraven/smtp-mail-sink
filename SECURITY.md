@@ -26,14 +26,23 @@ That last point is a deliberate, bounded exception. `deploy.ps1` never sets `DOT
 so a deployed container runs as `Production` and gets the strict rules; and a plain-text port
 configured outside `Development` is a startup error rather than a quiet downgrade.
 
-Per-account folders are not an access boundary either. They keep one client's mail out of
-another's listing, and nothing reads mail back out over SMTP, but anyone who can reach the share
-can read all of it.
+Per-account folders on a filesystem are not an access boundary. They keep one client's mail out of
+another's listing, and nothing reads mail back out over SMTP, but anyone who can reach the mail
+directory can read all of it. In Azure they are, because there each account writes to a blob
+container of its own and a container is the smallest scope an Entra ID role assignment takes: a
+`Storage Blob Data Reader` grant on `orders` reads the orders mail and nothing else.
 
 The unencrypted store is the part to plan around. Anything the sink captures is readable by anyone
 who can reach the host or the storage behind it — the transport and the credentials are protected,
-the mail at rest is not. Treat the mail directory, and the Azure Files share behind it, as the
+the mail at rest is not. Treat the mail directory, and the blob container behind it, as the
 boundary that actually protects captured mail.
+
+In Azure that boundary is Entra ID. Captured mail goes to blob containers that the container group
+writes to as its own managed identity, one per account, the storage account is deployed with shared
+key access disabled, and reading the mail is a role assignment on a container — so there is no
+account key to leak, no key to hand to a person, and every read is attributable in the storage
+logs. A deployment that predates this still has an Azure Files share with mail on it; `deploy.ps1`
+will not disable the key while that share exists, because SMB cannot be reached without it.
 
 Reports that amount to "the Development mode accepts any password" or "stored messages are not
 encrypted" will be closed with a pointer to this page.
@@ -60,7 +69,11 @@ Report it if you find a way to:
   configured `MaxMessageSize` and session limits,
 - recover a configured password, or the certificate's private key, from a log, a file name, or a
   stored message,
-- obtain the Azure storage key from anything the deployment scripts do.
+- read or write captured mail in Azure without a role assignment on the blob container holding it:
+  obtain a storage account key from anything the deployment scripts do, get the container group to
+  accept a key or a SAS token in its configuration, reach a container as any identity other than
+  the one it was granted, or get one account's mail written to or read from another account's
+  container.
 
 ## Dependencies and the image
 

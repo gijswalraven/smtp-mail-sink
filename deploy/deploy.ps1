@@ -1,11 +1,12 @@
-<#
+﻿<#
 .SYNOPSIS
-    Deploys mail sink to Azure Container Instances with an Azure Files share for the .eml output.
+    Deploys mail sink to Azure Container Instances, with a blob container per account for the .eml
+    output.
 
 .DESCRIPTION
-    Creates (idempotently) a container registry, a storage account with a "mail" file share, a
-    key vault holding the SMTP credentials, a user-assigned managed identity, and the container
-    group itself.
+    Creates (idempotently) a container registry, a storage account with a blob container per
+    account, a key vault holding the SMTP credentials, a user-assigned managed identity, and the
+    container group itself.
 
     Resource names are derived from -NamePrefix plus a hash of the subscription and resource group,
     so re-running the script targets the same resources instead of creating new ones.
@@ -16,9 +17,19 @@
     the container group.
 
     No secret reaches a command line. The generated SMTP password goes to "az keyvault secret set"
-    through a temporary file, because --value would put it on one. The storage account key and the
-    registry password travel the same way: the container group is deployed from a generated JSON
-    file rather than from switches, and that file is deleted as soon as the call returns.
+    through a temporary file, because --value would put it on one. The registry password, on the runs that
+    use one, travels the same way: the container group is deployed from a generated JSON file
+    rather than from switches, and that file is deleted as soon as the call returns.
+
+    No storage account key is involved at all. Captured mail goes to blob containers the container
+    group reaches with its managed identity, and the account is created with shared key access
+    disabled, so the key stops being a credential that can be leaked, handed out, or left in
+    someone's script. Reading the mail back is an Entra ID role -- "Storage Blob Data Reader" --
+    which puts a named person in the storage logs and can be taken away again afterwards.
+
+    Each account gets a container of its own rather than a folder in a shared one, because a
+    container is the smallest scope a role assignment takes. One account's mail can therefore be
+    granted to someone without granting the rest, which a folder could not do.
 
     Deploying from a file is also the only way to declare a liveness probe -- ACI offers no CLI
     switch for one -- so the container group is restarted when the sink stops answering on its
@@ -37,7 +48,7 @@
 
 .PARAMETER SmtpUsername
     Username the sink will require, for a sink with one client. Stored in the key vault alongside
-    the password. Its mail goes to the root of the file share. Ignored when -Accounts is given.
+    the password. Its mail goes to the "mail" container. Ignored when -Accounts is given.
 
 .PARAMETER SmtpPassword
     Password the sink will require. Omit it and a 32-character random one is generated on the
@@ -47,14 +58,16 @@
 .PARAMETER Accounts
     Names of the accounts the sink will accept, for several clients sharing one sink. Each gets
     its own credential pair -- username and generated password, both in the key vault -- and its
-    own folder on the file share, so one client's mail never lands among another's.
+    own blob container, so one client's mail never lands among another's and can be granted to
+    someone on its own.
 
-    The name is the username, the folder, and the suffix of the vault secrets, so keep it to
-    letters, digits and hyphens. Use -SmtpUsername instead when there is only one client.
+    The name is the username, the container, and the suffix of the vault secrets, so it is held to
+    what all three accept: 3-31 lower-case letters, digits and single hyphens. Use -SmtpUsername
+    instead when there is only one client.
 
     Every run must name every account: the container group is deployed with exactly the accounts
-    listed here, so leaving one out removes its credentials from the sink. The mail it already
-    delivered stays on the share.
+    listed here, so leaving one out removes its credentials from the sink. Its container, and the
+    mail already in it, stays where it is.
 
 .PARAMETER RotatePassword
     Replace the stored password with a freshly generated one, even though a secret already exists.
@@ -71,8 +84,9 @@
 
 .PARAMETER RetentionHours
     How long the sink keeps a captured message before deleting it. 0, the default, keeps
-    everything: the share then grows until someone empties it. The sink does the deleting itself,
-    on the mounted share, so nothing outside the container has to run on a schedule.
+    everything: the container then grows until someone empties it. The sink does the deleting
+    itself, across every container it writes to, so nothing outside the container group has to run
+    on a schedule and no lifecycle rule has to be kept in step with this setting.
 
 .PARAMETER UseAdminCredentials
     Pull the image with the registry's admin username/password instead of the managed identity.
@@ -124,9 +138,9 @@ param(
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,
 
-    # 0 keeps captured mail forever. Anything else has the sink delete its own .eml files off the
-    # share once they reach that age. A year is the ceiling only because a longer one is far more
-    # likely to be a typo than a wish.
+    # 0 keeps captured mail forever. Anything else has the sink delete its own .eml blobs once
+    # they reach that age. A year is the ceiling only because a longer one is far more likely to
+    # be a typo than a wish.
     [ValidateRange(0, 8760)]
     [int]$RetentionHours = 0,
 
@@ -158,9 +172,9 @@ param(
     # which would otherwise block on the prompt.
     [switch]$Force,
 
-    # Private only. Locks the storage account down to the container subnet, so the captured mail
-    # stops being reachable from any network with the account key. Add your own IP afterwards to
-    # keep reading the share; the script prints the command.
+    # Private only. Limits the storage account to the container subnet, on top of the identity
+    # that is already the only way in: a stolen token then has to be used from that subnet as
+    # well. Add your own IP afterwards to keep reading the mail; the script prints the command.
     [switch]$RestrictStorageNetwork
 )
 
@@ -343,7 +357,6 @@ function New-SmtpPassword {
     $alphanumeric = [Convert]::ToBase64String($bytes) -replace '[^A-Za-z0-9]', ''
     return $alphanumeric.Substring(0, 32)
 }
-
 if ($Exposure -eq 'Public' -and -not $DnsLabel) {
     throw 'A -DnsLabel is required when -Exposure is Public.'
 }
@@ -402,7 +415,19 @@ $storageName = "$NamePrefix$suffix"                        # 3-24 lowercase alph
 $identityName = "id-$NamePrefix-$suffix"
 $vaultName = "kv-$NamePrefix-$suffix"                      # 3-24 alphanumeric and hyphens
 $containerGroup = "aci-$NamePrefix"
-$shareName = 'mail'
+$blobEndpoint = "https://$storageName.blob.core.windows.net"
+
+# Each account writes to a blob container named after it; this one takes the mail that belongs to
+# no account, which is the single-client -SmtpUsername shape. A container rather than a folder per
+# account because a container is the smallest thing an Entra ID role can be scoped to: one
+# account's mail can then be granted to someone on its own.
+$defaultContainer = 'mail'
+
+# What deployments made before the sink wrote to blob storage mounted at /mail. Nothing here
+# copies or deletes it -- that mail is someone's evidence of what an application sent -- but
+# whether it is still there decides whether the account key can be switched off, because SMB is
+# the one thing on this account that cannot work without it.
+$legacyShareName = 'mail'
 
 $usernameSecret = 'mailsink-smtp-username'
 $passwordSecret = 'mailsink-smtp-password'
@@ -412,9 +437,10 @@ $tlsCertificate = 'mailsink-smtp-tls'
 # the container's environment, the summary -- is written once against a list rather than twice
 # against two shapes of the same thing.
 #
-# A key vault secret name may only hold letters, digits and hyphens, and the sink refuses a
-# folder that is not a plain directory name, so the account name is held to the intersection of
-# both rather than mapped into them. A name that has to be mangled to fit is better rejected
+# A key vault secret name may only hold letters, digits and hyphens, a blob container name only
+# lower-case letters, digits and hyphens with no pair of them together, and the sink refuses a
+# folder that is not a plain directory name -- so the account name is held to the intersection of
+# all three rather than mapped into them. A name that has to be mangled to fit is better rejected
 # here than silently turned into something an operator did not write.
 if ($Accounts) {
     if ($SmtpPassword) {
@@ -427,30 +453,38 @@ if ($Accounts) {
     }
 
     $accountList = foreach ($name in $Accounts) {
-        if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,30}$') {
-            throw "-Accounts entry '$name' must be 1-31 letters, digits or hyphens, starting with a letter or digit. It is used as a username, a folder name and a key vault secret name."
+        if ($name -notmatch '^[a-z0-9][a-z0-9-]{1,29}[a-z0-9]$' -or $name -match '--') {
+            throw "-Accounts entry '$name' must be 3-31 lower-case letters, digits or hyphens, must start and end with a letter or digit, and cannot contain two hyphens in a row. It is used as a username, a key vault secret name, and the name of the blob container that account's mail goes to."
         }
 
         [pscustomobject]@{
             Key            = $name
             Username       = $name
             Folder         = $name
+            # A container of its own, which is what makes one account's mail something a role
+            # assignment can grant on its own.
+            Container      = $name
             UsernameSecret = "$usernameSecret-$name"
             PasswordSecret = "$passwordSecret-$name"
         }
     }
 }
 else {
-    # The single-client shape: no folder, so its mail lands in the root of the share exactly as
+    # The single-client shape: no folder, so its mail lands in the default container exactly where
     # it did before accounts existed.
     $accountList = @([pscustomobject]@{
             Key            = $SmtpUsername
             Username       = $SmtpUsername
             Folder         = $null
+            Container      = $defaultContainer
             UsernameSecret = $usernameSecret
             PasswordSecret = $passwordSecret
         })
 }
+
+# Exactly the containers this configuration writes to, so nothing is created that would sit empty
+# and suggest mail should be in it. Unique, because two accounts may deliberately share one.
+$containers = @($accountList | ForEach-Object { $_.Container } | Select-Object -Unique)
 
 if ($storageName.Length -gt 24) { throw "-NamePrefix is too long; the storage account name '$storageName' exceeds 24 characters." }
 if ($vaultName.Length -gt 24) { throw "-NamePrefix is too long; the key vault name '$vaultName' exceeds 24 characters." }
@@ -576,18 +610,34 @@ $jobs = [ordered]@{
         return ($json | ConvertFrom-Json)
     }
 
-    storage = Start-ThreadJob -ArgumentList $ResourceGroup, $storageName, $Location, $shareName -ScriptBlock {
-        param($rg, $name, $loc, $share)
+    storage = Start-ThreadJob -ArgumentList $ResourceGroup, $storageName, $Location, $containers, $legacyShareName -ScriptBlock {
+        param($rg, $name, $loc, $containerNames, $legacyShare)
         $ErrorActionPreference = 'Continue'
-        az storage account create -g $rg -n $name -l $loc --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false -o none 2>$null
+
+        # Shared key access is not disabled here but in a step of its own further down, because
+        # whether it can be disabled at all depends on what is already in this account.
+        $json = az storage account create -g $rg -n $name -l $loc --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false -o json 2>$null
         if ($LASTEXITCODE -ne 0) { throw "az storage account create failed ($LASTEXITCODE)" }
 
-        az storage share-rm create -g $rg --storage-account $name -n $share --quota 100 -o none 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "az storage share-rm create failed ($LASTEXITCODE)" }
+        # container-rm rather than "storage container create": it goes through ARM, so creating a
+        # container needs no data-plane credential -- no account key, and no blob role that has to
+        # have reached the caller first. The plain command would need one of the two, and the whole
+        # point here is that the first does not exist.
+        #
+        # One per account. An account removed from -Accounts on a later run keeps its container and
+        # the mail in it: nothing here deletes captured mail, it simply stops being written to.
+        foreach ($container in $containerNames) {
+            az storage container-rm create -g $rg --storage-account $name -n $container -o none 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "az storage container-rm create failed for '$container' ($LASTEXITCODE)" }
+        }
 
-        $key = az storage account keys list -g $rg --account-name $name --query '[0].value' -o tsv 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "az storage account keys list failed ($LASTEXITCODE)" }
-        return $key
+        $exists = az storage share-rm exists -g $rg --storage-account $name -n $legacyShare --query exists -o tsv 2>$null
+        $global:LASTEXITCODE = 0
+
+        return [pscustomobject]@{
+            Id          = ($json | ConvertFrom-Json).id
+            LegacyShare = ($exists -eq 'true')
+        }
     }
 
     identity = Start-ThreadJob -ArgumentList $ResourceGroup, $identityName, $Location -ScriptBlock {
@@ -638,8 +688,17 @@ catch {
 $loginServer = $results.registry.loginServer
 $registryId = $results.registry.id
 
-# Handed straight to az container create; never echoed, never written to disk.
-$storageKey = $results.storage
+$storageId = $results.storage.Id
+$legacyShareExists = $results.storage.LegacyShare
+
+# Roles are scoped to a container, never to the account: the sink has no business reading the rest
+# of the storage account, and with no key a role assignment is the only thing standing between
+# anyone and captured mail. One scope per account is also what lets a single account's mail be
+# granted to someone without granting all of it.
+function Get-ContainerScope {
+    param([Parameter(Mandatory)][string]$Container)
+    return "$storageId/blobServices/default/containers/$Container"
+}
 
 $identityId = $results.identity.id
 $principalId = $results.identity.principalId
@@ -783,15 +842,65 @@ if (Grant-Role -PrincipalId $principalId -Role 'Key Vault Certificate User' -Sco
 # The container is handed vault URIs, not secrets. Versionless, so restarting picks up a rotation.
 $certificateUri = "https://$vaultHost/certificates/$tlsCertificate"
 
+Step "Blob container access ($($containers -join ', '))"
+
+$newBlobAssignment = $false
+
+foreach ($container in $containers) {
+    $scope = Get-ContainerScope -Container $container
+    Write-Host "    $container"
+
+    # Contributor rather than Writer: the sink deletes what MailSink:Retention expires, and it does
+    # that itself so that retention needs no lifecycle rule kept in step with the setting and no
+    # second principal with rights over captured mail.
+    if (Grant-Role -PrincipalId $principalId -Role 'Storage Blob Data Contributor' -Scope $scope) {
+        $newBlobAssignment = $true
+    }
+
+    # Whoever deploys the sink is the one who reads the mail out of it, and with no account key
+    # there is nothing else that would let them. Reader, not Contributor: reading captured mail is
+    # the job, deleting it is the sink's. Granted per container, so handing one account's mail to
+    # a colleague later is one assignment on one container rather than access to everything.
+    Grant-Role -PrincipalId $callerObjectId -Role 'Storage Blob Data Reader' -Scope $scope -PrincipalType $callerType | Out-Null
+}
+
+# The point of the whole arrangement. While the key is enabled it stays a second way in, with no
+# identity behind it and nothing in the storage logs to say who used it -- so it is turned off
+# rather than merely left unused.
+$sharedKeyEnabled = Invoke-Az @('storage', 'account', 'show', '-g', $ResourceGroup, '-n', $storageName,
+    '--query', 'allowSharedKeyAccess', '-o', 'tsv')
+
+if ($legacyShareExists) {
+    # An earlier deployment mounted an Azure Files share, and SMB has no path that does not use
+    # the account key: disabling it now would make mail this sink already captured unreadable.
+    # Left enabled, loudly, until that share is drained and removed.
+    Write-Warning "the '$legacyShareName' file share from an earlier deployment is still on $storageName, and Azure Files cannot be reached without the account key, so shared key access is left enabled. Copy that mail somewhere and delete the share, then re-run; the summary prints both commands."
+}
+elseif ($sharedKeyEnabled -eq 'false') {
+    Write-Host '    shared key access already disabled'
+}
+else {
+    Invoke-Az @('storage', 'account', 'update', '-g', $ResourceGroup, '-n', $storageName,
+        '--allow-shared-key-access', 'false', '-o', 'none') | Out-Null
+    Write-Host '    shared key access disabled; the account key no longer authorises anything'
+}
+
 $environment = [ordered]@{
-    'MailSink__MailDirectory'                     = '/mail'
+    # Where captured mail goes. Not a secret and not a credential: the container reaches it as
+    # the identity below, so there is no key or SAS token in this definition to be read back out
+    # of "az container show".
+    'MailSink__Blob__ServiceUri'                  = $blobEndpoint
+    # Takes the mail that belongs to no account. Each account's own container is named by its
+    # Folder, further down, which is the same value the filesystem would have used.
+    'MailSink__Blob__Container'                   = $defaultContainer
+    'MailSink__Blob__ManagedIdentityClientId'     = $identityClientId
     # The image already listens on these, but naming them keeps the published ports and the
     # listener from drifting apart when either is changed.
     'MailSink__StartTlsPorts__0'                  = "$StartTlsPort"
     'MailSink__ImplicitTlsPorts__0'               = "$ImplicitTlsPort"
     # Not published, so it is reachable by the probe and not by a sender.
     'MailSink__HealthPort'                        = "$HealthPort"
-    # The sink sweeps the mounted share itself; 0 means it deletes nothing.
+    # The sink sweeps the blob container itself; 0 means it deletes nothing.
     'MailSink__Retention__MaxAge'                 = ([timespan]::FromHours($RetentionHours)).ToString()
     'TZ'                                          = $TimeZone
     # Not a secret: the certificate's private key is fetched through the managed identity.
@@ -809,8 +918,10 @@ if ($Accounts) {
     foreach ($account in $accountList) {
         $environment["MailSink__Accounts__$($account.Key)__Username"] = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$($account.UsernameSecret))"
         $environment["MailSink__Accounts__$($account.Key)__Password"] = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$($account.PasswordSecret))"
-        # Not a secret, and the one thing here worth reading straight off the container group:
-        # it is the difference between mail that is missing and mail that is somewhere else.
+        # Not a secret, and the one thing here worth reading straight off the container group: it
+        # is the difference between mail that is missing and mail that is somewhere else. It names
+        # this account's blob container, and would name its folder on a filesystem -- one setting,
+        # so the two destinations cannot be configured to disagree.
         $environment["MailSink__Accounts__$($account.Key)__Folder"] = $account.Folder
     }
 }
@@ -847,9 +958,12 @@ $ports = @(
 
 # The container group is deployed from a file rather than from switches, because a liveness probe
 # can only be expressed that way -- ACI has no CLI flag for one, and without a probe nothing can
-# tell a wedged container from a healthy one. It also keeps the storage account key and the
-# registry password off the command line, which the switch form could not do: they now travel in
-# a temp file that is deleted straight after.
+# tell a wedged container from a healthy one. It also keeps the registry password, on the runs
+# that use one, off the command line: it travels in a temp file that is deleted straight after.
+#
+# No volume. Captured mail goes to blob storage over HTTPS with the identity below, so there is
+# no share to mount and no account key for this definition to carry -- which was the last secret
+# in it.
 $group = [ordered]@{
     apiVersion = '2021-10-01'
     location   = $Location
@@ -858,7 +972,8 @@ $group = [ordered]@{
     identity   = [ordered]@{
         type                   = 'UserAssigned'
         # Attached whether or not it is also pulling the image: the sink needs it to read the
-        # credentials and the certificate out of the vault.
+        # credentials and the certificate out of the vault, and to store captured mail in the blob
+        # container, which is the only way it can reach either.
         userAssignedIdentities = @{ $identityId = @{} }
     }
     properties = [ordered]@{
@@ -875,7 +990,6 @@ $group = [ordered]@{
                     environmentVariables = @(
                         $environment.Keys | ForEach-Object { [ordered]@{ name = $_; value = $environment[$_] } }
                     )
-                    volumeMounts         = @([ordered]@{ name = 'mail'; mountPath = '/mail' })
                     livenessProbe        = [ordered]@{
                         httpGet             = [ordered]@{ path = '/healthz'; port = $HealthPort; scheme = 'http' }
                         # The sink has to reach Key Vault for its certificate before it answers,
@@ -886,16 +1000,6 @@ $group = [ordered]@{
                         timeoutSeconds      = 5
                         failureThreshold    = 3
                     }
-                }
-            }
-        )
-        volumes                  = @(
-            [ordered]@{
-                name      = 'mail'
-                azureFile = [ordered]@{
-                    shareName          = $shareName
-                    storageAccountName = $storageName
-                    storageAccountKey  = $storageKey
                 }
             }
         )
@@ -1015,16 +1119,16 @@ try {
             }
         }
         finally {
-            # The file carries the storage account key, so it does not outlive the call.
+            # Nothing secret is left in it, but a file describing the deployment has no reason to
+            # outlive the call either.
             Remove-Item $groupFile -Force -ErrorAction SilentlyContinue
         }
     }
 }
 finally {
-    # Drop the references once the key has served its purpose. This is tidiness, not erasure --
+    # Drop the references once they have served their purpose. This is tidiness, not erasure --
     # .NET strings are immutable, so the bytes stay in memory until the process ends.
     $group = $null
-    $storageKey = $null
     $registryPassword = $null
 }
 
@@ -1033,6 +1137,9 @@ if ($RestrictStorageNetwork) {
         Write-Warning '-RestrictStorageNetwork needs a subnet to allow, which -Exposure Public does not create. Skipped.'
     }
     else {
+        # Defence in depth rather than the control itself: reaching captured mail already needs a
+        # token for a principal with a role on the container. This means a stolen one also has to
+        # be used from inside the subnet.
         Step 'Restricting the storage account to the container subnet'
         Invoke-Az @('network', 'vnet', 'subnet', 'update', '-g', $ResourceGroup, '--vnet-name', $VNetName,
             '-n', $SubnetName, '--service-endpoints', 'Microsoft.Storage') | Out-Null
@@ -1043,8 +1150,8 @@ if ($RestrictStorageNetwork) {
         Invoke-Az @('storage', 'account', 'update', '-g', $ResourceGroup, '-n', $storageName,
             '--default-action', 'Deny') | Out-Null
 
-        Write-Host '    the share is now reachable only from that subnet. To read the mail from your'
-        Write-Host '    own machine, allow your public IP as well:'
+        Write-Host '    the storage account is now reachable only from that subnet. To read the mail'
+        Write-Host '    from your own machine, allow your public IP as well:'
         Write-Host "      az storage account network-rule add -g $ResourceGroup --account-name $storageName --ip-address <your-ip>"
     }
 }
@@ -1072,7 +1179,7 @@ else {
 Write-Host "  SMTP port : $StartTlsPort (STARTTLS), $ImplicitTlsPort (implicit TLS)"
 
 if ($Accounts) {
-    Write-Host "  SMTP users: $(($accountList | ForEach-Object { "$($_.Username) -> $($_.Folder)/" }) -join ', ')"
+    Write-Host "  SMTP users: $(($accountList | ForEach-Object { "$($_.Username) -> $($_.Container)" }) -join ', ')"
 }
 else {
     Write-Host "  SMTP user : $SmtpUsername"
@@ -1081,7 +1188,8 @@ else {
 Write-Host '  Auth      : required, over TLS only'
 Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
 Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
-Write-Host "  Mail share: $storageName/$shareName"
+Write-Host "  Mail store: $blobEndpoint, one container per account: $($containers -join ', ')"
+Write-Host '  Mail access: managed identity to write, an Entra ID role per container to read, no account key'
 $retentionSummary = $RetentionHours -eq 0 `
     ? 'off, mail is kept until you delete it (re-run with -RetentionHours)' `
     : "$RetentionHours h, swept hourly by the sink itself"
@@ -1101,18 +1209,44 @@ Write-Host 'Senders must also reach it by the name on the certificate. Connectin
 Write-Host 'will fail host name validation, which is the check doing the work here.'
 Write-Host ''
 
-if ($newVaultAssignment) {
-    Write-Host 'The vault role assignment was created just now. Until it propagates the sink cannot read' -ForegroundColor Yellow
-    Write-Host 'its password and will restart a few times; that settles on its own within a minute or two.' -ForegroundColor Yellow
+if ($newVaultAssignment -or $newBlobAssignment) {
+    Write-Host 'A role assignment was created just now. Until it propagates the sink cannot read its' -ForegroundColor Yellow
+    Write-Host 'credentials or store a message, so it may restart, and a delivery in that window is' -ForegroundColor Yellow
+    Write-Host 'refused with a 451 for the sender to retry. It settles within a minute or two.' -ForegroundColor Yellow
     Write-Host ''
 }
 
-Write-Host 'Read the captured mail by mapping the share as a drive. Keep the key in a variable and'
-Write-Host 'out of your shell history -- net use would put it on a command line:'
-Write-Host "  `$key = az storage account keys list -g $ResourceGroup --account-name $storageName --query '[0].value' -o tsv"
-Write-Host "  `$cred = [pscredential]::new('localhost\$storageName', (ConvertTo-SecureString `$key -AsPlainText -Force))"
-Write-Host "  New-PSDrive -Name Z -PSProvider FileSystem -Root \\$storageName.file.core.windows.net\$shareName -Credential `$cred"
-Write-Host "  `$key = `$null"
+# --auth-mode login is the whole difference: the CLI uses the identity you are signed in as and
+# the role granted above, so nothing here fetches, prints or stores an account key.
+Write-Host 'Read the captured mail as yourself -- there is no account key to fetch:'
+foreach ($container in $containers) {
+    Write-Host "  az storage blob list --account-name $storageName -c $container --auth-mode login --query '[].name' -o tsv"
+    Write-Host "  az storage blob download-batch --account-name $storageName -s $container --auth-mode login -d ."
+}
+Write-Host ''
+Write-Host 'Storage Explorer and azcopy do the same with a sign-in, and the portal shows a container'
+Write-Host 'directly. Because each account has a container of its own, one account can be handed to a'
+Write-Host 'colleague without handing over the rest -- a role assignment, not a credential:'
+foreach ($container in $containers) {
+    Write-Host "  az role assignment create --assignee <them> --role 'Storage Blob Data Reader' --scope $(Get-ContainerScope -Container $container)"
+}
 Write-Host ''
 Write-Host 'Follow the log with:'
 Write-Host "  az container logs -g $ResourceGroup -n $containerGroup --follow"
+
+# Last, so it is what is left on screen: until this share is gone the account key still works,
+# and the point of this deployment is that it does not.
+if ($legacyShareExists) {
+    Write-Host ''
+    Write-Host "The '$legacyShareName' file share is still on $storageName, holding what this sink" -ForegroundColor Yellow
+    Write-Host 'captured before it moved to blob storage. New mail goes to the container above, that' -ForegroundColor Yellow
+    Write-Host 'share is no longer mounted, and the account key stays enabled while it exists -- SMB' -ForegroundColor Yellow
+    Write-Host 'cannot be reached without one. Copy that mail off, delete the share, and re-run this' -ForegroundColor Yellow
+    Write-Host 'script; the key is then switched off for good:' -ForegroundColor Yellow
+    Write-Host "  `$key = az storage account keys list -g $ResourceGroup --account-name $storageName --query '[0].value' -o tsv"
+    Write-Host "  `$cred = [pscredential]::new('localhost\$storageName', (ConvertTo-SecureString `$key -AsPlainText -Force))"
+    Write-Host "  New-PSDrive -Name Z -PSProvider FileSystem -Root \\$storageName.file.core.windows.net\$legacyShareName -Credential `$cred"
+    Write-Host "  `$key = `$null"
+    Write-Host '  # copy what is worth keeping out of Z:, then'
+    Write-Host "  az storage share-rm delete -g $ResourceGroup --storage-account $storageName -n $legacyShareName"
+}

@@ -5,7 +5,10 @@ public sealed class MailSinkOptions
 {
     public const string SectionName = "MailSink";
 
-    /// <summary>Folder the .eml files are written to. Relative paths are resolved against the content root.</summary>
+    /// <summary>
+    /// Folder the .eml files are written to. Relative paths are resolved against the content root.
+    /// Ignored once <see cref="Blob"/> names a container, which is where a deployed sink writes.
+    /// </summary>
     public string MailDirectory { get; set; } = "mail";
 
     /// <summary>
@@ -77,6 +80,12 @@ public sealed class MailSinkOptions
 
     /// <summary>TLS settings. Required outside Development.</summary>
     public TlsOptions Tls { get; set; } = new();
+
+    /// <summary>
+    /// Azure Blob Storage destination. Naming a container sends captured mail there instead of to
+    /// <see cref="MailDirectory"/>, authenticated as the host's managed identity.
+    /// </summary>
+    public BlobOptions Blob { get; set; } = new();
 
     /// <summary>How long captured mail is kept. Off unless an age is configured.</summary>
     public RetentionOptions Retention { get; set; } = new();
@@ -168,6 +177,7 @@ public sealed class MailSinkOptions
 
         ValidateAccounts();
         ValidateRetention();
+        ValidateBlobContainers();
 
         if (isDevelopment)
         {
@@ -217,6 +227,46 @@ public sealed class MailSinkOptions
             throw new InvalidOperationException(
                 $"{SectionName}:Retention:SweepInterval has to be positive; an interval of zero " +
                 "would sweep the mail directory in a loop.");
+        }
+    }
+
+    /// <summary>
+    /// Checks that every folder can be a container, once mail goes to blob storage and a folder is
+    /// one. Only then: a filesystem takes names Azure will not, and a local run has no reason to
+    /// be held to rules that only apply to a deployment.
+    /// </summary>
+    /// <remarks>
+    /// The asymmetry is a footgun worth naming: an account called "Orders" works on a filesystem
+    /// and cannot be a container, so the error says which setting and which rule rather than
+    /// leaving it to a 400 from the service on the first message. deploy.ps1 holds -Accounts to
+    /// the intersection of both sets of rules for the same reason.
+    /// </remarks>
+    private void ValidateBlobContainers()
+    {
+        if (!Blob.IsConfigured)
+        {
+            return;
+        }
+
+        if (MailNaming.DescribeInvalidContainerName(Blob.Container) is { } containerProblem)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:Blob:Container '{Blob.Container}' {containerProblem}");
+        }
+
+        foreach (var account in ResolveAccounts())
+        {
+            // An empty folder is the account that writes to Blob:Container, checked just above.
+            if (account.Folder.Length == 0 ||
+                MailNaming.DescribeInvalidContainerName(account.Folder) is not { } problem)
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"The folder '{account.Folder}' of account '{account.Key}' {problem} Captured mail " +
+                $"goes to a container per account because {SectionName}:Blob:ServiceUri is set, so " +
+                "the folder names one.");
         }
     }
 

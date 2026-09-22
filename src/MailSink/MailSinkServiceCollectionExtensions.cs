@@ -29,7 +29,6 @@ public static class MailSinkServiceCollectionExtensions
 
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<SinkHealth>();
-        services.AddSingleton<IMailWriter, FileMailWriter>();
         services.AddSingleton<IMessageMetadataReader, MimeMessageMetadataReader>();
         services.AddSingleton<IMailCapture, MailCapture>();
 
@@ -41,6 +40,19 @@ public static class MailSinkServiceCollectionExtensions
         var bound = section.Get<MailSinkOptions>() ?? new MailSinkOptions();
         var isDevelopment = environment.IsDevelopment();
         bound.Validate(isDevelopment);
+
+        // A container named in configuration is what decides where mail goes, so that a local run
+        // and a Windows service keep writing files with no Azure dependency at all: the blob
+        // writer is not constructed, and no credential chain is built looking for an identity that
+        // is not there.
+        if (bound.Blob.IsConfigured)
+        {
+            services.AddSingleton<IMailWriter, BlobMailWriter>();
+        }
+        else
+        {
+            services.AddSingleton<IMailWriter, FileMailWriter>();
+        }
 
         // An authenticator is registered only when an account is configured, so that a local run
         // genuinely leaves nothing that accepts credentials rather than only hiding the AUTH

@@ -1,5 +1,6 @@
 using MailSink;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace MailSink.Tests;
 
@@ -8,8 +9,15 @@ public class FileMailWriterTests : IDisposable
     private readonly string _root =
         Path.Combine(Path.GetTempPath(), "mail-sink-tests", Guid.NewGuid().ToString("n"));
 
-    private FileMailWriter Writer() =>
-        new(TestOptions.For(o => o.MailDirectory = _root), new TestHostEnvironment());
+    private FileMailWriter Writer(Action<MailSinkOptions>? configure = null) =>
+        new(
+            TestOptions.For(settings =>
+            {
+                settings.MailDirectory = _root;
+                configure?.Invoke(settings);
+            }),
+            new TestHostEnvironment(),
+            NullLogger<FileMailWriter>.Instance);
 
     [Fact]
     public async Task Writes_the_message_under_the_mail_directory()
@@ -85,17 +93,122 @@ public class FileMailWriterTests : IDisposable
     [Fact]
     public void Creates_each_account_folder_up_front()
     {
-        _ = new FileMailWriter(
-            TestOptions.For(o =>
-            {
-                o.MailDirectory = _root;
-                o.Accounts["orders"] = new MailAccount { Username = "o", Password = "p" };
-                o.Accounts["crm"] = new MailAccount { Username = "c", Password = "p", Folder = "crm-mail" };
-            }),
-            new TestHostEnvironment());
+        _ = Writer(o =>
+        {
+            o.Accounts["orders"] = new MailAccount { Username = "o", Password = "p" };
+            o.Accounts["crm"] = new MailAccount { Username = "c", Password = "p", Folder = "crm-mail" };
+        });
 
         Assert.True(Directory.Exists(Path.Combine(_root, "orders")));
         Assert.True(Directory.Exists(Path.Combine(_root, "crm-mail")));
+    }
+
+    // The sweep, against a real temp folder: deleting mail is the one thing the sink does that
+    // cannot be undone, so what it keeps matters as much as what it removes.
+
+    private static readonly DateTimeOffset Now = new(2026, 9, 21, 10, 0, 0, TimeSpan.Zero);
+
+    /// <summary>The cutoff a 24-hour MaxAge produces at <see cref="Now"/>.</summary>
+    private static readonly DateTimeOffset Cutoff = Now - TimeSpan.FromHours(24);
+
+    /// <summary>Writes a file and backdates it, which is what the sweep judges age by.</summary>
+    private string Existing(string relativePath, TimeSpan age)
+    {
+        var path = Path.Combine(_root, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "Subject: hi\r\n\r\nbody");
+        File.SetLastWriteTimeUtc(path, (Now - age).UtcDateTime);
+        return path;
+    }
+
+    [Fact]
+    public async Task Sweep_deletes_messages_older_than_the_cutoff()
+    {
+        var stale = Existing("2026-09-19/101010-000_a.eml", TimeSpan.FromHours(48));
+        var fresh = Existing("2026-09-21/090000-000_b.eml", TimeSpan.FromHours(1));
+
+        var result = await Writer().SweepAsync(Cutoff, default);
+
+        Assert.Equal(1, result.Messages);
+        Assert.False(File.Exists(stale));
+        Assert.True(File.Exists(fresh));
+    }
+
+    [Fact]
+    public async Task Sweep_keeps_a_message_exactly_at_the_cutoff()
+    {
+        // The boundary decides whether "keep 24 hours" means 24 or 23:59:59.999, and a file that
+        // is exactly at the age has not yet passed it.
+        var boundary = Existing("2026-09-20/100000-000_a.eml", TimeSpan.FromHours(24));
+
+        var result = await Writer().SweepAsync(Cutoff, default);
+
+        Assert.Equal(0, result.Messages);
+        Assert.True(File.Exists(boundary));
+    }
+
+    [Fact]
+    public async Task Sweep_leaves_files_that_are_not_eml()
+    {
+        var stale = Existing("2026-09-19/101010-000_a.eml", TimeSpan.FromHours(48));
+        var other = Existing("2026-09-19/notes.txt", TimeSpan.FromHours(48));
+
+        await Writer().SweepAsync(Cutoff, default);
+
+        Assert.False(File.Exists(stale));
+        Assert.True(File.Exists(other));
+    }
+
+    [Fact]
+    public async Task Sweep_removes_the_date_folders_it_empties_but_keeps_the_mail_directory()
+    {
+        Existing("2026-09-19/101010-000_a.eml", TimeSpan.FromHours(48));
+
+        var result = await Writer().SweepAsync(Cutoff, default);
+
+        Assert.Equal(new SweepResult(1, 1), result);
+        Assert.False(Directory.Exists(Path.Combine(_root, "2026-09-19")));
+        Assert.True(Directory.Exists(_root));
+    }
+
+    [Fact]
+    public async Task Sweep_keeps_a_date_folder_that_still_holds_mail()
+    {
+        Existing("2026-09-19/101010-000_a.eml", TimeSpan.FromHours(48));
+        Existing("2026-09-19/101011-000_b.eml", TimeSpan.FromHours(1));
+
+        var result = await Writer().SweepAsync(Cutoff, default);
+
+        Assert.Equal(0, result.Folders);
+        Assert.True(Directory.Exists(Path.Combine(_root, "2026-09-19")));
+    }
+
+    [Fact]
+    public async Task Sweep_keeps_an_account_folder_it_has_emptied()
+    {
+        // The account folders are created at startup so an operator can see the layout; an empty
+        // one says the account exists and has had no mail, which a missing one does not.
+        Existing("orders/2026-09-19/101010-000_a.eml", TimeSpan.FromHours(48));
+
+        var writer = Writer(settings => settings.Accounts["orders"] = new MailAccount
+        {
+            Username = "orders",
+            Password = "pw",
+        });
+
+        var result = await writer.SweepAsync(Cutoff, default);
+
+        Assert.Equal(new SweepResult(1, 1), result);
+        Assert.False(Directory.Exists(Path.Combine(_root, "orders", "2026-09-19")));
+        Assert.True(Directory.Exists(Path.Combine(_root, "orders")));
+    }
+
+    [Fact]
+    public async Task Sweep_finds_nothing_to_do_in_an_empty_mail_directory()
+    {
+        var result = await Writer().SweepAsync(Cutoff, default);
+
+        Assert.Equal(new SweepResult(0, 0), result);
     }
 
     public void Dispose()
