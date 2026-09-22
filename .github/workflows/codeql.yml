@@ -1,0 +1,52 @@
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # New queries ship with the CodeQL bundle, so an unchanged tree is worth re-analysing.
+  schedule:
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Only to publish the SARIF to the repository's code scanning alerts.
+      security-events: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: csharp
+          # C# also supports build-mode: none, which is faster but resolves fewer types and so
+          # misses flow through anything it could not bind. This project already builds cleanly
+          # on this runner in the ci workflow, so there is no reason to give that up.
+          build-mode: manual
+          # The default suite is tuned to keep noise down on large codebases. This one is a few
+          # thousand lines that parses hostile input off a socket, so it can afford the extra
+          # queries.
+          queries: security-extended
+
+      - name: Build for the extractor
+        # Has to sit between init and analyze: CodeQL builds its database by watching the
+        # compiler run, so a --no-build step here would produce an empty database.
+        run: |
+          dotnet restore --locked-mode
+          dotnet build --no-restore --configuration Release
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:csharp

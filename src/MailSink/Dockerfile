@@ -1,7 +1,9 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
-COPY MailSink.csproj .
-RUN dotnet restore
+# The lock file comes along so the restore layer is pinned to the same transitive graph CI
+# verified, rather than whatever nuget.org resolves on the day the image happens to build.
+COPY MailSink.csproj packages.lock.json ./
+RUN dotnet restore --locked-mode
 COPY . .
 RUN dotnet publish -c Release -o /app
 

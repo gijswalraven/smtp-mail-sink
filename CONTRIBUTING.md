@@ -12,6 +12,10 @@ dotnet build
 dotnet test
 ```
 
+Both projects use a committed `packages.lock.json`. If you change a `PackageReference`, run a
+plain `dotnet restore` and commit the updated lock file with it — CI restores with
+`--locked-mode` and will fail if the two have drifted apart.
+
 CI runs the tests on both Linux and Windows. File naming depends on
 `Path.GetInvalidFileNameChars()`, which returns a very different set on each, so please make sure
 anything touching names passes on both.

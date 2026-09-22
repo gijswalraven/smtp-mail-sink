@@ -62,6 +62,14 @@ Report it if you find a way to:
   stored message,
 - obtain the Azure storage key from anything the deployment scripts do.
 
+## Dependencies and the image
+
+CI fails on any advisory against any NuGet package in the graph, direct or transitive, runs CodeQL
+over the C#, and scans the container image; the audit and the image scan also run weekly so an
+advisory filed against an unchanged dependency still surfaces. [README.md](README.md#supply-chain)
+has the detail. A vulnerability in a dependency is best reported upstream, but tell me too if the
+sink is what makes it reachable.
+
 ## Reporting
 
 Please use GitHub's **private vulnerability reporting** on this repository

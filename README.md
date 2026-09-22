@@ -478,6 +478,45 @@ empty one means that account has had no mail), and anything that is not a `.eml`
 cannot delete — one still being written, or a share that went away for a moment — is logged and
 tried again on the next sweep.
 
+## Supply chain
+
+Both projects restore from a committed `packages.lock.json`, and CI restores with `--locked-mode`,
+so a build on a runner resolves the same transitive graph a build on your machine did. Regenerate
+the lock files with a plain `dotnet restore` whenever a `PackageReference` changes and commit the
+result — a locked-mode restore fails if the two disagree, which is the whole point of it.
+
+Beyond the tests, CI gates on:
+
+- **`dotnet list package --vulnerable --include-transitive`** — fails on any advisory against any
+  package in the graph, direct or not. The command exits 0 whether or not it finds something, so
+  the job reads the report rather than the exit code.
+- **[dependency-review-action](https://github.com/actions/dependency-review-action)** — pull
+  requests only. Catches a dependency being *added* with a known advisory, at review time, which
+  the audit above only catches once the merge has happened.
+- **CodeQL** for C#, on the `security-extended` suite. Results land in the repository's code
+  scanning alerts.
+- **[Trivy](https://github.com/aquasecurity/trivy)** against the image the `image` job builds.
+  Fails on HIGH and CRITICAL that have a fix available, and uploads a CycloneDX SBOM of the image
+  as a workflow artifact.
+
+The Worker SDK's default content glob puts `packages.lock.json` into the publish output, so it
+ships inside the image as well. That is worth leaving alone: it is what gives an image scanner
+the full NuGet graph to work from, rather than only what `MailSink.deps.json` names.
+
+The audit, CodeQL and the image scan also run weekly. That is the case a push-triggered build
+never sees: an advisory filed against a dependency nobody touched.
+
+`deploy.ps1` attaches a CycloneDX SBOM to the image it pushes, as an OCI referrer on the manifest
+rather than a file somewhere — delete the image and the SBOM goes with it:
+
+```powershell
+oras discover <registry>.azurecr.io/mail-sink:<tag>
+```
+
+ACR tasks have no SBOM switch of their own, so that step shells out to `trivy` and
+[`oras`](https://oras.land). Without both on `PATH` the deployment prints what it skipped and
+carries on.
+
 ## Alternatives
 
 If you want a sink with a web UI to browse captured mail, [Mailpit](https://github.com/axllent/mailpit)

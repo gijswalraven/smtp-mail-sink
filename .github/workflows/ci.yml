@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A dependency that is clean today can have an advisory filed against it tomorrow without
+  # anyone touching this repository, and the same goes for the base image. The weekly run is
+  # what turns the audit and image scan below into something that actually catches those.
+  schedule:
+    - cron: '17 6 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -29,11 +34,56 @@ jobs:
         with:
           global-json-file: global.json
 
-      - run: dotnet restore
+      # Locked mode restores exactly the graph in packages.lock.json and fails if the two
+      # disagree, so a transitive package cannot change underneath a build that nobody edited.
+      - run: dotnet restore --locked-mode
 
       - run: dotnet build --no-restore --configuration Release
 
       - run: dotnet test --no-build --configuration Release
+
+  audit:
+    # The dependency graph is the same on both platforms, so one runner is enough.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - run: dotnet restore --locked-mode
+
+      - name: Fail on vulnerable packages
+        # "dotnet list package --vulnerable" reports findings on stdout and still exits 0, so the
+        # gate has to read the report rather than trust the exit code. --include-transitive
+        # matters more than the direct list: nothing here references a vulnerable package
+        # directly, the risk is three levels down.
+        run: |
+          report=$(dotnet list package --vulnerable --include-transitive)
+          echo "$report"
+          if grep -q 'has the following vulnerable packages' <<<"$report"; then
+            echo "::error::Vulnerable NuGet packages found. Bump the offending package, or its"\
+                 "parent, and regenerate the lock files with a plain 'dotnet restore'."
+            exit 1
+          fi
+
+  dependency-review:
+    # Diffs the manifests of the base and head commits, so it only has anything to say on a pull
+    # request. It catches a dependency being added at review time, which the audit job only
+    # catches once an advisory exists for it.
+    if: github.event_name == 'pull_request'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/dependency-review-action@v5
+        with:
+          # Same bar as the audit job, which fails on any advisory regardless of severity.
+          fail-on-severity: low
 
   image:
     # The Dockerfile drops to a non-root user and chowns the mail directory; a build here catches
@@ -51,3 +101,30 @@ jobs:
           user=$(docker run --rm --entrypoint id mail-sink:ci -u)
           echo "container uid: $user"
           test "$user" != "0"
+
+      # Generated before the scan that can fail, so the inventory of what is in the image is
+      # available precisely when the build went red and someone needs to know what shipped.
+      - name: Generate an SBOM for the image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: mail-sink:ci
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      - name: Scan the image for known vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: mail-sink:ci
+          severity: HIGH,CRITICAL
+          # Without this the job goes red for base image CVEs that have no patched version yet,
+          # which there is no action to take on and which trains everyone to ignore the result.
+          # The weekly run picks them up on the day a fix lands.
+          ignore-unfixed: true
+          exit-code: '1'

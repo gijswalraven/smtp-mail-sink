@@ -5,6 +5,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>dotnet-MailSink-9b976ca7-5bc0-4b9b-af80-d3c76021f320</UserSecretsId>
+    <!-- packages.lock.json pins the whole transitive graph, not just the versions named
+         below. CI restores in locked mode, so a transitive package that moves underneath
+         us fails the restore instead of quietly shipping. Regenerate with a plain
+         "dotnet restore" and commit the result whenever a PackageReference changes. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
   <ItemGroup>

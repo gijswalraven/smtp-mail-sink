@@ -491,6 +491,62 @@ function Get-SourceHash {
     }
 }
 
+# ACR tasks have no SBOM switch of their own, so it is produced from the image the build just
+# pushed and attached to that image as an OCI referrer: "oras discover" on the tag lists it, and
+# deleting the image takes the SBOM with it. Needs trivy and oras on PATH. Without them, or if
+# either fails, the deployment says so and carries on -- an image in the registry with no SBOM
+# beside it is worse than one with, but better than a sink nobody could deploy.
+function Add-ImageSbom {
+    param(
+        # Registry short name, which is what "az acr login" takes.
+        [Parameter(Mandatory)][string]$Registry,
+        # Full <loginServer>/<repository>:<tag> of the image that was just pushed.
+        [Parameter(Mandatory)][string]$Reference
+    )
+
+    $missing = @('trivy', 'oras') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+    if ($missing) {
+        Write-Host "    no SBOM attached: $($missing -join ' and ') not on PATH"
+        Write-Host '    install with: winget install AquaSecurity.Trivy ORASProject.ORAS'
+        return
+    }
+
+    # --expose-token hands back a registry refresh token without a docker login, so neither tool
+    # needs a credential store to exist. The token never reaches a command line: trivy reads it
+    # from the environment, oras from stdin. The username is the all-zero GUID ACR expects
+    # alongside a refresh token rather than a real account.
+    $nullUser = '00000000-0000-0000-0000-000000000000'
+    $token = Invoke-Az @('acr', 'login', '-n', $Registry, '--expose-token', '--query', 'accessToken', '-o', 'tsv')
+
+    # oras splits its file argument on ":" to read the media type off the end, which a Windows
+    # path defeats at the drive letter. Generating into a scratch directory and referring to the
+    # file by bare name sidesteps that entirely.
+    $sbomDir = Join-Path ([IO.Path]::GetTempPath()) "mail-sink-sbom-$([guid]::NewGuid().ToString('n'))"
+    New-Item -ItemType Directory -Path $sbomDir | Out-Null
+    Push-Location $sbomDir
+    try {
+        $env:TRIVY_USERNAME = $nullUser
+        $env:TRIVY_PASSWORD = $token
+
+        & trivy image --quiet --format cyclonedx --output 'sbom.cdx.json' $Reference
+        if ($LASTEXITCODE -ne 0) { throw "trivy image failed with exit code $LASTEXITCODE" }
+
+        $token | & oras attach --artifact-type 'application/vnd.cyclonedx+json' --username $nullUser --password-stdin $Reference 'sbom.cdx.json:application/vnd.cyclonedx+json'
+        if ($LASTEXITCODE -ne 0) { throw "oras attach failed with exit code $LASTEXITCODE" }
+
+        Write-Host "    SBOM attached to $Reference (list it with: oras discover $Reference)"
+    }
+    catch {
+        Write-Warning "no SBOM attached to ${Reference}: $($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item Env:TRIVY_USERNAME -ErrorAction SilentlyContinue
+        Remove-Item Env:TRIVY_PASSWORD -ErrorAction SilentlyContinue
+        Pop-Location
+        Remove-Item $sbomDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $sourceHash = Get-SourceHash -Root $projectPath
 $imageTag = "mail-sink:$sourceHash"
 
@@ -610,6 +666,10 @@ else {
     finally {
         Pop-Location
     }
+
+    # Only on the path that actually built something: an image that was already in the registry
+    # got its SBOM from the run that pushed it.
+    Add-ImageSbom -Registry $registryName -Reference "$loginServer/$imageTag"
 }
 
 # RBAC rather than access policies: the same role assignments as everything else in the script,
