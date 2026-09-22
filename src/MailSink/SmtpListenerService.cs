@@ -65,10 +65,27 @@ public sealed class SmtpListenerService(
 
         if (SmtpOptionsFactory.IsPlainText(_options, isDevelopment))
         {
-            logger.LogWarning(
-                "This sink is running in the Development environment: the connection is not " +
-                "encrypted{Unauthenticated}. Do not expose it beyond your own machine.",
-                _options.HasCredentials ? string.Empty : " and mail is accepted from anyone");
+            if (isDevelopment)
+            {
+                logger.LogWarning(
+                    "This sink is running in the Development environment: the connection is not " +
+                    "encrypted{Unauthenticated}. Do not expose it beyond your own machine.",
+                    _options.HasCredentials ? string.Empty : " and mail is accepted from anyone");
+            }
+            else
+            {
+                // A deployed sink with TLS switched off. Loud, and repeated on every start,
+                // because the whole point of the setting is to be temporary: the credentials and
+                // the mail are on the wire in clear text for anyone on the path to read.
+                logger.LogWarning(
+                    "TLS IS DISABLED. MailSink:TlsMode is None and this is the {Environment} " +
+                    "environment, so this sink accepts mail over an unencrypted connection: the " +
+                    "password every sender authenticates with, and the mail itself, cross the " +
+                    "network in clear text and can be read or altered in transit. This is a " +
+                    "diagnostic setting. Set TlsMode back to StartTls or Implicit as soon as the " +
+                    "test is done, and treat any credential used against it as compromised.",
+                    environment.EnvironmentName);
+            }
         }
 
         try

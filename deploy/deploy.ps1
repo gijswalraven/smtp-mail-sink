@@ -89,6 +89,12 @@
     itself, across every container it writes to, so nothing outside the container group has to run
     on a schedule and no lifecycle rule has to be kept in step with this setting.
 
+.PARAMETER BlobSoftDeleteDays
+    How long a deleted blob, or a deleted container, stays recoverable. Seven days by default.
+    Blob versioning is switched on alongside it, so overwriting a blob keeps the previous content
+    too. The sink expires its own mail and nothing cross-checks it, so this is the only thing
+    standing between a bug in that sweep and mail that is simply gone.
+
 .PARAMETER UseAdminCredentials
     Pull the image with the registry's admin username/password instead of the managed identity.
     Microsoft's docs list a Premium registry as a prerequisite for managed-identity pulls; if the
@@ -139,7 +145,12 @@ param(
     # Implicit is TLS from the first byte. They cannot share a port -- implicit TLS has the client
     # open with a handshake and STARTTLS has the server open with a greeting -- so senders are
     # told which one this sink speaks.
-    [ValidateSet('StartTls', 'Implicit')]
+    #
+    # None switches TLS off entirely, which is a diagnostic setting and nothing else: it is the
+    # only way to tell a sender that fails because of TLS from one that fails for another reason.
+    # The password and the mail then cross the network in clear text. The sink warns on every
+    # start, and so does the summary at the end of this script.
+    [ValidateSet('StartTls', 'Implicit', 'None')]
     [string]$TlsMode = 'StartTls',
 
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
@@ -150,6 +161,11 @@ param(
     # more likely to be a typo than a wish.
     [ValidateRange(0, 8760)]
     [int]$RetentionHours = 168,
+
+    # How long a deleted blob stays recoverable. The sink is the only thing deleting captured
+    # mail, so this is what a bug in its sweeper is caught by. Azure allows 1-365.
+    [ValidateRange(1, 365)]
+    [int]$BlobSoftDeleteDays = 7,
 
     [string]$TimeZone = 'Europe/Amsterdam',
     [string]$Cpu = '0.5',
@@ -624,14 +640,25 @@ $jobs = [ordered]@{
         return ($json | ConvertFrom-Json)
     }
 
-    storage = Start-ThreadJob -ArgumentList $ResourceGroup, $storageName, $Location, $containers, $legacyShareName -ScriptBlock {
-        param($rg, $name, $loc, $containerNames, $legacyShare)
+    storage = Start-ThreadJob -ArgumentList $ResourceGroup, $storageName, $Location, $containers, $legacyShareName, $BlobSoftDeleteDays -ScriptBlock {
+        param($rg, $name, $loc, $containerNames, $legacyShare, $softDeleteDays)
         $ErrorActionPreference = 'Continue'
 
         # Shared key access is not disabled here but in a step of its own further down, because
         # whether it can be disabled at all depends on what is already in this account.
         $json = az storage account create -g $rg -n $name -l $loc --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false -o json 2>$null
         if ($LASTEXITCODE -ne 0) { throw "az storage account create failed ($LASTEXITCODE)" }
+
+        # The sink deletes its own mail on a retention sweep, and there is deliberately no
+        # lifecycle rule to cross-check it, so a bug in the sweeper would otherwise have no undo.
+        # Soft delete is that undo: a deleted blob stays recoverable for the window below, and
+        # versioning keeps the previous content of anything overwritten. Container-level soft
+        # delete covers the larger mistake of removing a whole account's container.
+        az storage account blob-service-properties update -g $rg --account-name $name `
+            --enable-delete-retention true --delete-retention-days $softDeleteDays `
+            --enable-container-delete-retention true --container-delete-retention-days $softDeleteDays `
+            --enable-versioning true -o none 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "az storage account blob-service-properties update failed ($LASTEXITCODE)" }
 
         # container-rm rather than "storage container create": it goes through ARM, so creating a
         # container needs no data-plane credential -- no account key, and no blob role that has to
@@ -909,8 +936,8 @@ $environment = [ordered]@{
     'MailSink__Blob__Container'                   = $defaultContainer
     'MailSink__Blob__ManagedIdentityClientId'     = $identityClientId
     # The sink binds loopback unless told otherwise, which inside a container group would make
-    # it unreachable. TLS is on here, so this is not the unencrypted case that
-    # AllowPlainTextFromAnyAddress guards.
+    # it unreachable. With TLS on that is not the unencrypted case AllowPlainTextFromAnyAddress
+    # guards; with -TlsMode None it is exactly that case, and the waiver is set below.
     'MailSink__ListenAddress'                     = '0.0.0.0'
     # The image already listens on these, but naming them keeps the published ports and the
     # listener from drifting apart when either is changed.
@@ -928,6 +955,21 @@ $environment = [ordered]@{
     'MailSink__KeyVault__AllowedHosts__0'         = $vaultHost
     # A container group can carry several identities; the default credential cannot guess.
     'MailSink__KeyVault__ManagedIdentityClientId' = $identityClientId
+}
+
+# TLS off is the one case where an unencrypted listener is deliberately reachable from the
+# network, so the guard that normally refuses that combination has to be waived explicitly. The
+# certificate stays in the vault and its URI is dropped rather than deleted, so switching back is
+# a re-run with -TlsMode StartTls and nothing else.
+if ($TlsMode -eq 'None') {
+    $environment.Remove('MailSink__Tls__KeyVaultCertificateUri')
+    $environment['MailSink__AllowPlainTextFromAnyAddress'] = 'true'
+
+    Write-Warning ('-TlsMode None: this sink will accept mail over an unencrypted connection. ' +
+        'The password every sender authenticates with, and the mail itself, will cross the ' +
+        'public internet in clear text. Use it to isolate a TLS problem and then re-run with ' +
+        '-TlsMode StartTls; treat the password as compromised afterwards and rotate it with ' +
+        '-RotatePassword.')
 }
 
 # The credentials, as references rather than values. MailSink:Username and MailSink:Accounts are
@@ -1193,7 +1235,11 @@ else {
     Write-Host "  SMTP host : $ip (private, reachable from $VNetName only)"
 }
 
-$modeSummary = $TlsMode -eq 'Implicit' ? 'implicit TLS, encrypted from the first byte' : 'STARTTLS, required before AUTH'
+$modeSummary = switch ($TlsMode) {
+    'Implicit' { 'implicit TLS, encrypted from the first byte' }
+    'None' { 'NO TLS -- plain text, credentials in the clear' }
+    default { 'STARTTLS, required before AUTH' }
+}
 Write-Host "  SMTP port : $Port ($modeSummary)"
 
 if ($Accounts) {
@@ -1203,8 +1249,16 @@ else {
     Write-Host "  SMTP user : $SmtpUsername"
 }
 
-Write-Host '  Auth      : required, over TLS only'
-Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
+$authSummary = $TlsMode -eq 'None' `
+    ? '  Auth      : required, but offered over an UNENCRYPTED connection' `
+    : '  Auth      : required, over TLS only'
+Write-Host $authSummary
+if ($TlsMode -eq 'None') {
+    Write-Host "  Cert      : not presented -- TLS is off (it stays in the vault for the way back)"
+}
+else {
+    Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
+}
 Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
 Write-Host "  Mail store: $blobEndpoint, one container per account: $($containers -join ', ')"
 Write-Host '  Mail access: managed identity to write, an Entra ID role per container to read, no account key'
@@ -1219,12 +1273,20 @@ foreach ($account in $accountList) {
     Write-Host "  az keyvault secret show --vault-name $vaultName -n $($account.PasswordSecret) --query value -o tsv"
 }
 Write-Host ''
-Write-Host 'The certificate is self-signed, so senders must be told to trust it. Export the public'
-Write-Host 'half and install it wherever the sending application keeps its trusted roots:'
-Write-Host "  az keyvault certificate download --vault-name $vaultName -n $tlsCertificate -f mailsink.crt"
-Write-Host ''
-Write-Host 'Senders must also reach it by the name on the certificate. Connecting to the bare IP'
-Write-Host 'will fail host name validation, which is the check doing the work here.'
+if ($TlsMode -eq 'None') {
+    Write-Host 'TLS IS OFF. Senders need no certificate and must not use one: configure them for a' -ForegroundColor Yellow
+    Write-Host 'plain connection with no STARTTLS and no SSL. The password is sent in clear text and' -ForegroundColor Yellow
+    Write-Host 'so is the mail. Re-run with -TlsMode StartTls when the test is done, then rotate the' -ForegroundColor Yellow
+    Write-Host 'password with -RotatePassword.' -ForegroundColor Yellow
+}
+else {
+    Write-Host 'The certificate is self-signed, so senders must be told to trust it. Export the public'
+    Write-Host 'half and install it wherever the sending application keeps its trusted roots:'
+    Write-Host "  az keyvault certificate download --vault-name $vaultName -n $tlsCertificate -f mailsink.crt"
+    Write-Host ''
+    Write-Host 'Senders must also reach it by the name on the certificate. Connecting to the bare IP'
+    Write-Host 'will fail host name validation, which is the check doing the work here.'
+}
 Write-Host ''
 
 if ($newVaultAssignment -or $newBlobAssignment) {

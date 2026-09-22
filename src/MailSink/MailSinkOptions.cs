@@ -215,26 +215,30 @@ public sealed class MailSinkOptions
                 "unauthenticated mail in a deployed environment; see SECURITY.md.");
         }
 
-        if (!Tls.IsConfigured)
+        // TlsMode None is a deliberate opt-out, so it is allowed here rather than refused: it is
+        // the only way to tell a sender that fails against TLS from one that fails for some other
+        // reason. It is not silent -- the listener warns on every start, and the deploy script
+        // warns again -- and it still requires credentials, because dropping two controls at once
+        // on the strength of one diagnostic is not a trade worth offering.
+        if (TlsMode != SmtpTlsMode.None && !Tls.IsConfigured)
         {
             throw new InvalidOperationException(
                 "MailSink:Tls:KeyVaultCertificateUri is required outside the Development " +
                 "environment. The sink does not accept mail over an unencrypted connection in a " +
-                "deployed environment; see SECURITY.md.");
-        }
-
-        if (TlsMode == SmtpTlsMode.None)
-        {
-            throw new InvalidOperationException(
-                "MailSink:TlsMode None configures a plain-text listener and is only allowed in " +
-                "the Development environment. Use StartTls or Implicit; see SECURITY.md.");
+                "deployed environment unless MailSink:TlsMode is set to None; see SECURITY.md.");
         }
     }
 
 
-    /// <summary>True when the listener will not be encrypted. Development only; see Validate.</summary>
+    /// <summary>True when the listener will not be encrypted.</summary>
+    /// <remarks>
+    /// Two ways to get here. <see cref="SmtpTlsMode.None"/> is deliberate and allowed anywhere,
+    /// including a deployed sink, so that a sender failing against TLS can be tested without it;
+    /// the listener logs a warning on every start in that case. The second is a Development run
+    /// with no certificate configured, which is the local convenience path.
+    /// </remarks>
     public bool IsPlainText(bool isDevelopment) =>
-        isDevelopment && (TlsMode == SmtpTlsMode.None || !Tls.IsConfigured);
+        TlsMode == SmtpTlsMode.None || (isDevelopment && !Tls.IsConfigured);
 
     /// <summary>
     /// Keeps the Development convenience from reaching the network. Running without TLS and

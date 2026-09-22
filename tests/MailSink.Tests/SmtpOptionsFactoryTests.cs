@@ -236,12 +236,84 @@ public class SmtpOptionsFactoryTests
     }
 
     [Fact]
-    public void Validate_refuses_a_plain_text_port_outside_development()
+    public void Validate_allows_TlsMode_None_outside_development_as_a_deliberate_opt_out()
     {
-        var options = Deployed(o => o.TlsMode = SmtpTlsMode.None);
+        // Switching TLS off in a deployment is how a sender that fails against TLS is told apart
+        // from one that fails for another reason. It is allowed, warned about, and not silent.
+        var options = Deployed(o =>
+        {
+            o.TlsMode = SmtpTlsMode.None;
+            o.AllowPlainTextFromAnyAddress = true;
+        });
+
+        options.Validate(isDevelopment: false);
+
+        Assert.True(options.IsPlainText(isDevelopment: false));
+    }
+
+    [Fact]
+    public void Validate_does_not_require_a_certificate_when_TlsMode_is_None()
+    {
+        var options = new MailSinkOptions
+        {
+            Username = "app",
+            Password = "s3cret",
+            TlsMode = SmtpTlsMode.None,
+            AllowPlainTextFromAnyAddress = true,
+        };
+
+        options.Validate(isDevelopment: false);
+    }
+
+    [Fact]
+    public void Validate_still_requires_credentials_when_TlsMode_is_None()
+    {
+        // One control at a time: dropping TLS for a test does not also open the sink to anyone.
+        var options = new MailSinkOptions
+        {
+            TlsMode = SmtpTlsMode.None,
+            AllowPlainTextFromAnyAddress = true,
+        };
 
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
 
-        Assert.Contains("only allowed in the Development environment", ex.Message);
+        Assert.Contains("required outside the Development environment", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_still_refuses_an_unencrypted_listener_that_anything_can_reach()
+    {
+        // TlsMode None does not waive the reach guard; a deployment has to say so separately.
+        var options = Deployed(o =>
+        {
+            o.TlsMode = SmtpTlsMode.None;
+            o.ListenAddress = "0.0.0.0";
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
+
+        Assert.Contains("AllowPlainTextFromAnyAddress", ex.Message);
+    }
+
+    [Fact]
+    public void Build_opens_an_unencrypted_endpoint_when_TlsMode_is_None_outside_development()
+    {
+        var options = Deployed(o =>
+        {
+            o.TlsMode = SmtpTlsMode.None;
+            o.AllowPlainTextFromAnyAddress = true;
+            o.Port = 2525;
+        });
+
+        var built = SmtpOptionsFactory.Build(options, isDevelopment: false, certificateFactory: null);
+
+        var endpoint = Assert.Single(built.Endpoints);
+        Assert.False(endpoint.IsSecure);
+        Assert.Null(endpoint.CertificateFactory);
+        Assert.Equal(2525, endpoint.Endpoint.Port);
+
+        // Credentials are still required, and now necessarily travel in the clear.
+        Assert.True(endpoint.AuthenticationRequired);
+        Assert.True(endpoint.AllowUnsecureAuthentication);
     }
 }

@@ -13,12 +13,18 @@ to understand before anything else:
 | ------------ | -------------------- | ------------------------------------------------------------ |
 | Transport    | plain text on `1025` | one port, `587` STARTTLS by default — see `TlsMode`          |
 | Credentials  | optional             | **required** — it will not start without them                |
-| Certificate  | none                 | **required**, from Key Vault — it will not start without one |
+| Certificate  | none                 | **required**, from Key Vault, unless `TlsMode` is `None`     |
 | Mail at rest | unencrypted          | unencrypted                                                  |
 
 Running it locally therefore costs no configuration, and deploying it cannot accidentally reuse
-that convenience: outside `Development` a missing certificate, a missing credential pair, or a
-configured plain-text port each stop the host at startup.
+that convenience: outside `Development` a missing certificate or a missing credential pair stops
+the host at startup.
+
+Turning TLS off in a deployed environment is possible, but only by asking for it: `TlsMode: None`
+is a diagnostic setting for telling a sender that fails against TLS apart from one that fails for
+another reason. It still requires credentials, it warns loudly on every start and again in the
+deploy script, and it puts those credentials on the wire in clear text — so rotate anything used
+against a sink in that state. [SECURITY.md](SECURITY.md) has the reasoning.
 
 > [!WARNING]
 > **Captured mail is stored unencrypted, in both modes.**
@@ -107,7 +113,7 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `ListenAddress`                | `127.0.0.1`  | Bind address. A container needs `0.0.0.0` to be reachable.                                  |
 | `AllowPlainTextFromAnyAddress` | `false`      | Lets an unencrypted listener bind something other than loopback.                            |
 | `Port`                         | `0`          | The one port to listen on. `0` takes the conventional port for `TlsMode`.                   |
-| `TlsMode`                      | `StartTls`   | `StartTls` (587), `Implicit` (465), or `None` (1025, **`Development` only**).               |
+| `TlsMode`                      | `StartTls`   | `StartTls` (587), `Implicit` (465), or `None` (1025) — see below before using `None`.        |
 | `MaxMessageSize`               | `10485760`   | Bytes. Larger messages are rejected with 552.                                               |
 | `Username`                     | *(empty)*    | Single client. Required outside `Development` unless `Accounts` is set.                     |
 | `Password`                     | *(empty)*    | Password for `Username`. Required once it is set.                                           |
@@ -202,6 +208,15 @@ container is what an Entra ID role can be scoped to.
 
 Each AUTH attempt is compared against every configured account, with no early exit, so how long a
 rejection takes does not say which usernames exist.
+
+**Turning TLS off.** `TlsMode: None` listens in plain text, and unlike every other control here
+it is allowed in a deployed environment rather than refused. It exists for one job: telling a
+sender that fails *because of* TLS apart from one that fails for some other reason. The password
+and the mail then cross the network in clear text, so the sink logs a warning on every start, the
+deploy script warns twice, and the listener still refuses to be reachable from a non-loopback
+address unless `AllowPlainTextFromAnyAddress` is also set. Switch it back with
+`-TlsMode StartTls` and rotate the password with `-RotatePassword` — treat anything sent over it
+as disclosed.
 
 **AUTH is only ever offered across an encrypted connection.** On a STARTTLS port it is absent from
 the first `EHLO` and appears in the second, after the upgrade. Together with that `530`, this
