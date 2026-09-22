@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace MailSink;
 
 /// <summary>Configuration for the sink, bound from the "MailSink" configuration section.</summary>
@@ -23,21 +25,20 @@ public sealed class MailSinkOptions
     public string ServerName { get; set; } = "mail-sink";
 
     /// <summary>
-    /// Plain-text ports. <b>Development only</b> -- configuring one anywhere else fails at
-    /// startup, so a loose port cannot be left open in production by accident.
+    /// Port the sink listens on. One port, whose TLS behaviour is <see cref="TlsMode"/>.
     /// </summary>
     /// <remarks>
-    /// This and the two TLS port lists are all left empty on purpose, with their real defaults in
-    /// <see cref="SmtpOptionsFactory"/>: the configuration binder appends to array defaults rather
-    /// than replacing them, so a default here would be added to whatever the config file specifies.
+    /// Zero, the default, means "the conventional port for the mode" -- resolved by
+    /// <see cref="SmtpOptionsFactory.ResolvePort"/> rather than here, so the default follows the
+    /// mode instead of having to be restated whenever the mode changes.
     /// </remarks>
-    public int[] Ports { get; set; } = [];
+    public int Port { get; set; }
 
-    /// <summary>Ports that start in plain text and require STARTTLS before AUTH.</summary>
-    public int[] StartTlsPorts { get; set; } = [];
-
-    /// <summary>Ports that are TLS from the first byte.</summary>
-    public int[] ImplicitTlsPorts { get; set; } = [];
+    /// <summary>
+    /// Whether the port starts in plain text and upgrades with STARTTLS, is TLS from the first
+    /// byte, or is not encrypted at all. <see cref="SmtpTlsMode.None"/> is Development only.
+    /// </summary>
+    public SmtpTlsMode TlsMode { get; set; } = SmtpTlsMode.StartTls;
 
     /// <summary>1025 is the conventional sink port; 25 is privileged on Linux.</summary>
     public const int DefaultPort = 1025;
@@ -48,11 +49,31 @@ public sealed class MailSinkOptions
     /// <summary>465, the conventional implicit-TLS submission port.</summary>
     public const int DefaultImplicitTlsPort = 465;
 
-    /// <summary>Address to bind to. 0.0.0.0 accepts from other machines and containers.</summary>
-    public string ListenAddress { get; set; } = "0.0.0.0";
+    /// <summary>
+    /// Address to bind to. Loopback by default, so nothing is exposed to the network until it is
+    /// asked for; a container needs 0.0.0.0 to be reachable at all, and both the compose file and
+    /// the deploy script set it.
+    /// </summary>
+    public string ListenAddress { get; set; } = "127.0.0.1";
 
-    /// <summary>Largest accepted message in bytes; anything bigger is rejected with 552.</summary>
-    public int MaxMessageSize { get; set; } = 25 * 1024 * 1024;
+    /// <summary>
+    /// Lets an unencrypted listener bind something other than loopback. Off, because a plain-text
+    /// sink on 0.0.0.0 hands every message and every credential to anyone on the network, and
+    /// that should never happen by inheriting a default.
+    /// </summary>
+    /// <remarks>
+    /// The compose file sets this: inside a container 0.0.0.0 is the only address that can be
+    /// reached at all, and the published port is bound to the host's loopback instead. Nothing
+    /// else should need it.
+    /// </remarks>
+    public bool AllowPlainTextFromAnyAddress { get; set; }
+
+    /// <summary>
+    /// Largest accepted message in bytes; anything bigger is rejected with 552. Each in-flight
+    /// message is held whole in memory, so this multiplied by
+    /// <see cref="MaxConcurrentSessions"/> is the ceiling the host has to fit inside.
+    /// </summary>
+    public int MaxMessageSize { get; set; } = 10 * 1024 * 1024;
 
     /// <summary>
     /// Shorthand for a single account that writes to the root of the mail directory, which is
@@ -175,9 +196,11 @@ public sealed class MailSinkOptions
                 "MailSink:Password is set without MailSink:Username, so nothing would enforce it.");
         }
 
+        ValidatePort();
         ValidateAccounts();
         ValidateRetention();
         ValidateBlobContainers();
+        ValidatePlainTextReach(isDevelopment);
 
         if (isDevelopment)
         {
@@ -200,11 +223,54 @@ public sealed class MailSinkOptions
                 "deployed environment; see SECURITY.md.");
         }
 
-        if (Ports.Length > 0)
+        if (TlsMode == SmtpTlsMode.None)
         {
             throw new InvalidOperationException(
-                "MailSink:Ports configures a plain-text listener and is only allowed in the " +
-                "Development environment. Use MailSink:StartTlsPorts or MailSink:ImplicitTlsPorts.");
+                "MailSink:TlsMode None configures a plain-text listener and is only allowed in " +
+                "the Development environment. Use StartTls or Implicit; see SECURITY.md.");
+        }
+    }
+
+
+    /// <summary>True when the listener will not be encrypted. Development only; see Validate.</summary>
+    public bool IsPlainText(bool isDevelopment) =>
+        isDevelopment && (TlsMode == SmtpTlsMode.None || !Tls.IsConfigured);
+
+    /// <summary>
+    /// Keeps the Development convenience from reaching the network. Running without TLS and
+    /// often without credentials is what makes a local sink zero-configuration, and it is exactly
+    /// what must not be bound to an address other machines can reach -- so that combination has
+    /// to be asked for explicitly rather than arrived at by leaving a default in place.
+    /// </summary>
+    private void ValidatePlainTextReach(bool isDevelopment)
+    {
+        if (!IsPlainText(isDevelopment) || AllowPlainTextFromAnyAddress)
+        {
+            return;
+        }
+
+        if (IPAddress.TryParse(ListenAddress, out var address) && !IPAddress.IsLoopback(address))
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:ListenAddress is {ListenAddress}, which other machines can reach, " +
+                "and this listener has no TLS. Bind 127.0.0.1, configure TLS, or set " +
+                $"{SectionName}:AllowPlainTextFromAnyAddress to true if an unencrypted sink really " +
+                "should be reachable from the network -- inside a container, where the published " +
+                "port is what limits reach, that is what the compose file does.");
+        }
+    }
+
+    /// <summary>
+    /// Refuses a port number that is not one, so the failure names the setting rather than
+    /// surfacing as an ArgumentOutOfRangeException from deep inside the socket layer.
+    /// </summary>
+    private void ValidatePort()
+    {
+        if (Port != 0 && (Port < 1 || Port > 65535))
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:Port is {Port}, which is not a usable port. Use 1-65535, or 0 to " +
+                "take the conventional port for the configured TlsMode.");
         }
     }
 

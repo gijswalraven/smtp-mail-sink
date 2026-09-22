@@ -19,52 +19,49 @@ public class SmtpOptionsFactoryTests
         return options;
     }
 
-    [Fact]
-    public void ResolvePorts_falls_back_to_the_default_when_none_are_configured()
+    [Theory]
+    [InlineData(SmtpTlsMode.StartTls, MailSinkOptions.DefaultStartTlsPort)]
+    [InlineData(SmtpTlsMode.Implicit, MailSinkOptions.DefaultImplicitTlsPort)]
+    [InlineData(SmtpTlsMode.None, MailSinkOptions.DefaultPort)]
+    public void ResolvePort_falls_back_to_the_conventional_port_for_the_mode(
+        SmtpTlsMode mode, int expected)
     {
-        var ports = SmtpOptionsFactory.ResolvePorts(new MailSinkOptions { Ports = [] });
+        var port = SmtpOptionsFactory.ResolvePort(new MailSinkOptions { TlsMode = mode }, isDevelopment: false);
 
-        Assert.Equal([MailSinkOptions.DefaultPort], ports);
+        Assert.Equal(expected, port);
     }
 
     [Fact]
-    public void ResolvePorts_removes_duplicates()
+    public void A_development_run_without_a_certificate_listens_on_the_plain_text_port()
     {
-        // Regression: the configuration binder appends to array defaults rather than replacing
-        // them, which once produced a listener bound to "1025, 1025".
-        var ports = SmtpOptionsFactory.ResolvePorts(new MailSinkOptions { Ports = [1025, 1025, 2525] });
+        // Regression: TlsMode stays at its StartTls default when no certificate is configured,
+        // and resolving the port from the mode alone put the sink on 587 while compose published
+        // 1025, so nothing could reach it.
+        var port = SmtpOptionsFactory.ResolvePort(new MailSinkOptions(), isDevelopment: true);
 
-        Assert.Equal([1025, 2525], ports);
+        Assert.Equal(MailSinkOptions.DefaultPort, port);
     }
 
     [Fact]
-    public void ResolvePorts_keeps_the_configured_ports_only()
+    public void A_configured_certificate_puts_it_back_on_the_submission_port()
     {
-        var ports = SmtpOptionsFactory.ResolvePorts(new MailSinkOptions { Ports = [25] });
+        var options = new MailSinkOptions
+        {
+            Tls = { KeyVaultCertificateUri = "https://v.vault.azure.net/certificates/smtp" },
+        };
 
-        Assert.Equal([25], ports);
-        Assert.DoesNotContain(MailSinkOptions.DefaultPort, ports);
+        Assert.Equal(MailSinkOptions.DefaultStartTlsPort, SmtpOptionsFactory.ResolvePort(options, isDevelopment: true));
     }
 
-    [Fact]
-    public void ResolveTlsPorts_falls_back_to_587_and_465()
+    [Theory]
+    [InlineData(SmtpTlsMode.StartTls)]
+    [InlineData(SmtpTlsMode.Implicit)]
+    [InlineData(SmtpTlsMode.None)]
+    public void ResolvePort_keeps_a_configured_port_whatever_the_mode(SmtpTlsMode mode)
     {
-        var (startTls, implicitTls) = SmtpOptionsFactory.ResolveTlsPorts(new MailSinkOptions());
+        var port = SmtpOptionsFactory.ResolvePort(new MailSinkOptions { Port = 2525, TlsMode = mode }, isDevelopment: false);
 
-        Assert.Equal([MailSinkOptions.DefaultStartTlsPort], startTls);
-        Assert.Equal([MailSinkOptions.DefaultImplicitTlsPort], implicitTls);
-    }
-
-    [Fact]
-    public void ResolveTlsPorts_does_not_add_a_default_alongside_a_configured_port()
-    {
-        // Asking for implicit TLS alone must not also quietly open 587.
-        var options = new MailSinkOptions { ImplicitTlsPorts = [4465] };
-
-        var (startTls, implicitTls) = SmtpOptionsFactory.ResolveTlsPorts(options);
-
-        Assert.Empty(startTls);
-        Assert.Equal([4465], implicitTls);
+        Assert.Equal(2525, port);
     }
 
     [Fact]
@@ -92,7 +89,7 @@ public class SmtpOptionsFactoryTests
         {
             o.ServerName = "test-sink";
             o.ListenAddress = "127.0.0.1";
-            o.StartTlsPorts = [2525, 2526];
+            o.Port = 2525;
             o.MaxMessageSize = 1234;
             o.MaxAuthenticationAttempts = 2;
         });
@@ -100,20 +97,44 @@ public class SmtpOptionsFactoryTests
         var built = SmtpOptionsFactory.Build(options, isDevelopment: false, new FakeCertificateFactory());
 
         Assert.Equal("test-sink", built.ServerName);
-        Assert.Equal([2525, 2526], built.Endpoints.Select(e => e.Endpoint.Port));
+        Assert.Equal(2525, Assert.Single(built.Endpoints).Endpoint.Port);
         Assert.Equal(2, built.MaxAuthenticationAttempts);
     }
 
     [Fact]
-    public void Build_opens_a_STARTTLS_and_an_implicit_TLS_endpoint_by_default()
+    public void Build_opens_one_STARTTLS_endpoint_by_default()
     {
         var built = SmtpOptionsFactory.Build(Deployed(), isDevelopment: false, new FakeCertificateFactory());
 
-        var startTls = Assert.Single(built.Endpoints, e => !e.IsSecure);
-        var implicitTls = Assert.Single(built.Endpoints, e => e.IsSecure);
+        var endpoint = Assert.Single(built.Endpoints);
+        Assert.False(endpoint.IsSecure);
+        Assert.Equal(MailSinkOptions.DefaultStartTlsPort, endpoint.Endpoint.Port);
+    }
 
-        Assert.Equal(MailSinkOptions.DefaultStartTlsPort, startTls.Endpoint.Port);
-        Assert.Equal(MailSinkOptions.DefaultImplicitTlsPort, implicitTls.Endpoint.Port);
+    [Fact]
+    public void Build_opens_one_implicit_TLS_endpoint_when_the_mode_says_so()
+    {
+        var options = Deployed(o => o.TlsMode = SmtpTlsMode.Implicit);
+
+        var built = SmtpOptionsFactory.Build(options, isDevelopment: false, new FakeCertificateFactory());
+
+        var endpoint = Assert.Single(built.Endpoints);
+        Assert.True(endpoint.IsSecure);
+        Assert.Equal(MailSinkOptions.DefaultImplicitTlsPort, endpoint.Endpoint.Port);
+    }
+
+    [Fact]
+    public void Build_never_opens_a_second_endpoint_for_the_other_mode()
+    {
+        // The point of the single-port shape: asking for one mode does not quietly also listen
+        // on the other, which is what the two port lists used to do.
+        foreach (var mode in new[] { SmtpTlsMode.StartTls, SmtpTlsMode.Implicit })
+        {
+            var built = SmtpOptionsFactory.Build(
+                Deployed(o => o.TlsMode = mode), isDevelopment: false, new FakeCertificateFactory());
+
+            Assert.Single(built.Endpoints);
+        }
     }
 
     [Fact]
@@ -143,7 +164,9 @@ public class SmtpOptionsFactoryTests
     public void Build_listens_in_plain_text_in_development()
     {
         var built = SmtpOptionsFactory.Build(
-            new MailSinkOptions { Ports = [2525] }, isDevelopment: true, certificateFactory: null);
+            new MailSinkOptions { Port = 2525, TlsMode = SmtpTlsMode.None },
+            isDevelopment: true,
+            certificateFactory: null);
 
         var endpoint = Assert.Single(built.Endpoints);
         Assert.False(endpoint.IsSecure);
@@ -215,7 +238,7 @@ public class SmtpOptionsFactoryTests
     [Fact]
     public void Validate_refuses_a_plain_text_port_outside_development()
     {
-        var options = Deployed(o => o.Ports = [1025]);
+        var options = Deployed(o => o.TlsMode = SmtpTlsMode.None);
 
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
 

@@ -6,11 +6,16 @@ services:
       # credentials. Compose is the local convenience path; a deployment sets neither of these and
       # the sink then refuses to start until a certificate and a credential pair are configured.
       - DOTNET_ENVIRONMENT=Development
+      # Inside a container 0.0.0.0 is the only address anything can reach, so an unencrypted
+      # listener has to say so explicitly. What actually limits reach is the published port below,
+      # which is bound to the host's loopback.
+      - MailSink__ListenAddress=0.0.0.0
+      - MailSink__AllowPlainTextFromAnyAddress=true
     ports:
       # Loopback only. In this mode the sink accepts any recipient from anyone, and Docker's
-      # published ports bypass the host firewall, so binding 0.0.0.0 would hand the whole LAN an
-      # open sink. To run the deployed posture locally, drop DOTNET_ENVIRONMENT, set
-      # MailSink__Tls__KeyVaultCertificateUri and the credentials, and publish 587 and 465.
+      # published ports bypass the host firewall, so publishing on 0.0.0.0 would hand the whole
+      # LAN an open sink. To run the deployed posture locally, drop DOTNET_ENVIRONMENT, set
+      # MailSink__Tls__KeyVaultCertificateUri and the credentials, and publish 587.
       - "127.0.0.1:1025:1025"
     volumes:
       - ./mail:/mail

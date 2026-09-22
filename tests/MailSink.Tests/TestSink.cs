@@ -70,7 +70,8 @@ internal sealed class TestSink : IAsyncDisposable
         {
             ["MailSink:MailDirectory"] = mailDirectory,
             ["MailSink:ListenAddress"] = "127.0.0.1",
-            [PortKey(transport)] = port.ToString(),
+            [PortKey] = port.ToString(),
+            ["MailSink:TlsMode"] = TlsModeFor(transport).ToString(),
             // Off unless a test asks for it: the default port would collide across the test
             // classes xunit runs in parallel, and outside Development that is a hard failure.
             ["MailSink:HealthPort"] = "0",
@@ -114,11 +115,14 @@ internal sealed class TestSink : IAsyncDisposable
         return new TestSink(host, port, mailDirectory, transport);
     }
 
-    private static string PortKey(SinkTransport transport) => transport switch
+    /// <summary>One port for every transport now; the mode is what distinguishes them.</summary>
+    private const string PortKey = "MailSink:Port";
+
+    private static SmtpTlsMode TlsModeFor(SinkTransport transport) => transport switch
     {
-        SinkTransport.PlainText => "MailSink:Ports:0",
-        SinkTransport.StartTls => "MailSink:StartTlsPorts:0",
-        SinkTransport.ImplicitTls => "MailSink:ImplicitTlsPorts:0",
+        SinkTransport.PlainText => SmtpTlsMode.None,
+        SinkTransport.StartTls => SmtpTlsMode.StartTls,
+        SinkTransport.ImplicitTls => SmtpTlsMode.Implicit,
         _ => throw new ArgumentOutOfRangeException(nameof(transport)),
     };
 

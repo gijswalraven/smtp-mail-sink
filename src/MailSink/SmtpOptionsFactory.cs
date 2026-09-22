@@ -10,24 +10,26 @@ namespace MailSink;
 public static class SmtpOptionsFactory
 {
     /// <summary>
-    /// Plain-text ports to bind, de-duplicated. Falls back to
-    /// <see cref="MailSinkOptions.DefaultPort"/> when none are configured - the options default is
-    /// deliberately empty because the configuration binder appends to array defaults instead of
-    /// replacing them.
+    /// The single port to bind. Zero means "the conventional port for the mode": 587 for
+    /// STARTTLS, 465 for implicit TLS, 1025 for the Development plain-text listener.
     /// </summary>
-    public static int[] ResolvePorts(MailSinkOptions options) =>
-        options.Ports.Length == 0
-            ? [MailSinkOptions.DefaultPort]
-            : [.. options.Ports.Distinct()];
-
-    /// <summary>
-    /// The two TLS port sets. Configuring either one takes the defaults off the table entirely,
-    /// so asking for implicit TLS alone does not silently also open 587.
-    /// </summary>
-    public static (int[] StartTls, int[] ImplicitTls) ResolveTlsPorts(MailSinkOptions options) =>
-        options.StartTlsPorts.Length == 0 && options.ImplicitTlsPorts.Length == 0
-            ? ([MailSinkOptions.DefaultStartTlsPort], [MailSinkOptions.DefaultImplicitTlsPort])
-            : ([.. options.StartTlsPorts.Distinct()], [.. options.ImplicitTlsPorts.Distinct()]);
+    /// <remarks>
+    /// Keyed on what the listener actually is rather than on TlsMode alone. A Development run
+    /// with no certificate leaves TlsMode at its StartTls default but listens in plain text, and
+    /// resolving that to 587 put the sink on the submission port while the compose file, the
+    /// Dockerfile and the docs all said 1025.
+    /// </remarks>
+    public static int ResolvePort(MailSinkOptions options, bool isDevelopment) =>
+        options.Port != 0
+            ? options.Port
+            : IsPlainText(options, isDevelopment)
+                ? MailSinkOptions.DefaultPort
+                : options.TlsMode switch
+                {
+                    SmtpTlsMode.Implicit => MailSinkOptions.DefaultImplicitTlsPort,
+                    SmtpTlsMode.None => MailSinkOptions.DefaultPort,
+                    _ => MailSinkOptions.DefaultStartTlsPort,
+                };
 
     public static IPAddress ResolveAddress(MailSinkOptions options) =>
         IPAddress.TryParse(options.ListenAddress, out var address)
@@ -37,12 +39,14 @@ public static class SmtpOptionsFactory
 
     /// <summary>True when the sink should listen in plain text rather than terminate TLS.</summary>
     /// <remarks>
-    /// Only ever true in Development -- <see cref="MailSinkOptions.Validate"/> refuses to start
-    /// anywhere else without a certificate. A developer who does configure one gets TLS locally
-    /// too, which is how the TLS path is exercised without deploying.
+    /// Only ever true in Development -- <see cref="MailSinkOptions.Validate"/> refuses both
+    /// <see cref="SmtpTlsMode.None"/> and a missing certificate anywhere else. An unconfigured
+    /// certificate still means plain text locally, so "compose up" needs no TLS settings at all;
+    /// a developer who does configure one gets TLS locally too, which is how the TLS path is
+    /// exercised without deploying.
     /// </remarks>
     public static bool IsPlainText(MailSinkOptions options, bool isDevelopment) =>
-        isDevelopment && !options.Tls.IsConfigured;
+        options.IsPlainText(isDevelopment);
 
     public static ISmtpServerOptions Build(
         MailSinkOptions options,
@@ -60,11 +64,7 @@ public static class SmtpOptionsFactory
 
         if (IsPlainText(options, isDevelopment))
         {
-            foreach (var port in ResolvePorts(options))
-            {
-                AddEndpoint(builder, options, address, port, isSecure: false, certificateFactory: null);
-            }
-
+            AddEndpoint(builder, options, address, ResolvePort(options, isDevelopment), isSecure: false, certificateFactory: null);
             return builder.Build();
         }
 
@@ -76,17 +76,15 @@ public static class SmtpOptionsFactory
                 $"{nameof(ICertificateFactory)} whenever MailSink:Tls:KeyVaultCertificateUri is set.");
         }
 
-        var (startTlsPorts, implicitTlsPorts) = ResolveTlsPorts(options);
-
-        foreach (var port in startTlsPorts)
-        {
-            AddEndpoint(builder, options, address, port, isSecure: false, certificateFactory);
-        }
-
-        foreach (var port in implicitTlsPorts)
-        {
-            AddEndpoint(builder, options, address, port, isSecure: true, certificateFactory);
-        }
+        // IsSecure is the whole difference between the two TLS modes: true hands the endpoint a
+        // TLS stream from the first byte, false leaves it in plain text until STARTTLS upgrades it.
+        AddEndpoint(
+            builder,
+            options,
+            address,
+            ResolvePort(options, isDevelopment),
+            isSecure: options.TlsMode == SmtpTlsMode.Implicit,
+            certificateFactory);
 
         return builder.Build();
     }

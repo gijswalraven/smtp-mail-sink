@@ -11,7 +11,7 @@ to understand before anything else:
 
 |              | `Development`        | Anywhere else                                                |
 | ------------ | -------------------- | ------------------------------------------------------------ |
-| Transport    | plain text on `1025` | STARTTLS on `587`, implicit TLS on `465`                     |
+| Transport    | plain text on `1025` | one port, `587` STARTTLS by default — see `TlsMode`          |
 | Credentials  | optional             | **required** — it will not start without them                |
 | Certificate  | none                 | **required**, from Key Vault — it will not start without one |
 | Mail at rest | unencrypted          | unencrypted                                                  |
@@ -38,9 +38,14 @@ dotnet run --project src/MailSink
 ```
 
 `dotnet run` puts the host in the `Development` environment, so the listener binds to
-`0.0.0.0:1025` in plain text, takes mail from anyone, and writes to
-`src/MailSink/mail/<yyyy-MM-dd>/`. Set `MailSink:ListenAddress` to `127.0.0.1` if you only need it
-on your own machine.
+`127.0.0.1:1025` in plain text, takes mail from anyone, and writes to
+`src/MailSink/mail/<yyyy-MM-dd>/`.
+
+Loopback is the default precisely because that mode has no TLS and usually no credentials. An
+unencrypted listener will not bind an address other machines can reach unless
+`MailSink:AllowPlainTextFromAnyAddress` is also set — a container needs that, because `0.0.0.0` is
+the only address reachable inside one, and [compose.yaml](compose.yaml) sets both while publishing
+the port on the host's loopback.
 
 ## Point an app at it
 
@@ -58,7 +63,7 @@ Against a deployed sink:
 | Setting | Value                                                            |
 | ------- | ---------------------------------------------------------------- |
 | Host    | the name on the certificate — not an IP, or validation will fail |
-| Port    | `587` for STARTTLS, `465` for implicit TLS                       |
+| Port    | one port for the sink's one mode: `587` STARTTLS, `465` implicit |
 | SSL/TLS | required; TLS 1.2 or 1.3                                         |
 | Auth    | required, and only offered once the connection is encrypted      |
 
@@ -69,8 +74,8 @@ In ASP.NET Core, locally and then deployed:
 "Smtp": { "Host": "mailsink.example.test", "Port": 587, "EnableSsl": true }
 ```
 
-`System.Net.Mail`'s `EnableSsl` means STARTTLS, so it can reach port 587 but not 465. A client that
-needs implicit TLS — or a per-connection certificate callback — wants
+`System.Net.Mail`'s `EnableSsl` means STARTTLS, so it can reach a `StartTls` sink but not an
+`Implicit` one. A client that needs implicit TLS — or a per-connection certificate callback — wants
 [MailKit](https://github.com/jstedfast/MailKit), which is what the tests here use.
 
 ## File names
@@ -99,11 +104,11 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | ---------------------------- | ----------- | --------------------------------------------------------------- |
 | `MailDirectory`              | `mail`      | Where `.eml` files go. Relative to the content root. Ignored once `Blob:ServiceUri` is set. |
 | `ServerName`                 | `mail-sink` | Name reported in the SMTP greeting.                             |
-| `ListenAddress`              | `0.0.0.0`   | Bind address. Use `127.0.0.1` to keep it local-only.            |
-| `Ports`                      | `[1025]`    | Plain text. **`Development` only** — a startup error elsewhere. |
-| `StartTlsPorts`              | `[587]`     | Require STARTTLS before AUTH.                                   |
-| `ImplicitTlsPorts`           | `[465]`     | TLS from the first byte.                                        |
-| `MaxMessageSize`             | `26214400`  | Bytes. Larger messages are rejected with 552.                   |
+| `ListenAddress`              | `127.0.0.1` | Bind address. A container needs `0.0.0.0` to be reachable.      |
+| `AllowPlainTextFromAnyAddress` | `false`   | Lets an unencrypted listener bind something other than loopback. |
+| `Port`                       | `0`         | The one port to listen on. `0` takes the conventional port for `TlsMode`. |
+| `TlsMode`                    | `StartTls`  | `StartTls` (587), `Implicit` (465), or `None` (1025, **`Development` only**). |
+| `MaxMessageSize`             | `10485760`  | Bytes. Larger messages are rejected with 552.                   |
 | `Username`                   | *(empty)*   | Single client. Required outside `Development` unless `Accounts` is set. |
 | `Password`                   | *(empty)*   | Password for `Username`. Required once it is set.               |
 | `Accounts:<name>:Username`   | *(none)*    | Several clients. One credential pair and one folder per account. |
@@ -296,7 +301,7 @@ Docker's port publishing bypasses the host firewall, so binding every interface 
 whole LAN an open sink. The container runs as a non-root user.
 
 To run the deployed posture under Docker instead, drop `DOTNET_ENVIRONMENT`, set
-`MailSink__Tls__KeyVaultCertificateUri` and the credentials, and publish `587` and `465`. The
+`MailSink__Tls__KeyVaultCertificateUri` and the credentials, and publish `587`. The
 image binds those directly even though it runs as a non-root user, because container runtimes set
 `net.ipv4.ip_unprivileged_port_start=0`.
 
@@ -316,8 +321,9 @@ your shell profile — the script reads both.
 
 Because a bare `./deploy.ps1` would otherwise create resources in whichever subscription the az CLI
 happens to be pointed at, it prints the resolved subscription and asks to continue. Naming a
-`-Subscription` or `-ResourceGroup` explicitly skips the prompt, as does `-Force` for unattended
-runs.
+`-Subscription` or `-ResourceGroup` explicitly skips the prompt. `-Force` skips it too, for
+unattended runs, but then requires `-Subscription`: skipping the confirmation and leaving the
+target implicit are each defensible, and together they deploy a mail sink somewhere nobody chose.
 
 That creates a Basic container registry, builds the image server-side with `az acr build`, creates
 a storage account with a blob container per account, creates a key vault holding the SMTP
@@ -364,8 +370,7 @@ is self-signed, senders have to be told to trust it — the script prints the
 `az keyvault certificate download` command for that. Replace the certificate in the vault with one
 from your own CA and the sink picks the replacement up on its next refresh.
 
-**Ports.** `-StartTlsPort` defaults to `2587` and `-ImplicitTlsPort` to `2465`, not the standard
-`587` and `465`. The image runs as a non-root user, and whether such a user may bind a privileged
+**Ports.** `-Port` defaults to `2587` and `-TlsMode` to `StartTls`, not the standard `587`. The image runs as a non-root user, and whether such a user may bind a privileged
 port depends on the runtime: Docker sets `net.ipv4.ip_unprivileged_port_start=0` and allows it,
 Azure Container Instances does not. Both were tested — on ACI the standard ports fail with
 `SocketException (13): Permission denied` and the container restarts forever. Senders therefore
@@ -456,7 +461,7 @@ Running as a service means relative paths resolve against the publish folder —
 `MailSink:MailDirectory` to an absolute path such as `C:\MailSink\mail`.
 
 A service has no `DOTNET_ENVIRONMENT` set, so it runs as `Production` and needs a certificate and
-a credential pair before it will start. It can bind `587` and `465` directly, unlike the
+a credential pair before it will start. It can bind `587` directly, unlike the
 container, so the defaults are right here. The service account needs to reach Key Vault: give the
 machine a managed identity, or set `MailSink:KeyVault:ManagedIdentityClientId`.
 
@@ -530,6 +535,10 @@ and there is no lifecycle rule to keep in step with this setting:
 ```powershell
 ./deploy/deploy.ps1 -RetentionHours 168
 ```
+
+`-RetentionHours` defaults to `168` — a week — rather than to keeping everything: captured mail is
+real mail, and a sink that accumulates it indefinitely is a liability rather than a feature. Pass
+`0` to turn the sweeper off and empty the containers yourself.
 
 What the sweeper leaves alone: the mail directory itself, every folder an account writes to (an
 empty one means that account has had no mail), and anything that is not a `.eml` file. A message it

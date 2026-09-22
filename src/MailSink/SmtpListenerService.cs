@@ -90,8 +90,7 @@ public sealed class SmtpListenerService(
                 $"Could not bind {DescribeTransport(_options, isDevelopment)} as this user. Ports " +
                 "below 1024 are privileged, and not every container runtime lets a non-root " +
                 "process bind one -- Azure Container Instances does not. Move the listener above " +
-                "1024 with MailSink:StartTlsPorts and MailSink:ImplicitTlsPorts, and publish or " +
-                "forward the port senders should see.",
+                "1024 with MailSink:Port, and publish or forward the port senders should see.",
                 ex);
         }
         finally
@@ -105,26 +104,16 @@ public sealed class SmtpListenerService(
     /// <summary>One line for the startup log, so the transport in force is never in doubt.</summary>
     private static string DescribeTransport(MailSinkOptions options, bool isDevelopment)
     {
+        var port = SmtpOptionsFactory.ResolvePort(options, isDevelopment);
+
         if (SmtpOptionsFactory.IsPlainText(options, isDevelopment))
         {
-            return $"plain text on port(s) {string.Join(", ", SmtpOptionsFactory.ResolvePorts(options))}, no TLS";
+            return $"plain text on port {port}, no TLS";
         }
 
-        var (startTls, implicitTls) = SmtpOptionsFactory.ResolveTlsPorts(options);
-
-        var parts = new List<string>(2);
-        if (startTls.Length > 0)
-        {
-            parts.Add($"STARTTLS on port(s) {string.Join(", ", startTls)}");
-        }
-
-        if (implicitTls.Length > 0)
-        {
-            parts.Add($"implicit TLS on port(s) {string.Join(", ", implicitTls)}");
-        }
-
+        var mode = options.TlsMode == SmtpTlsMode.Implicit ? "implicit TLS" : "STARTTLS";
         var floor = options.Tls.MinimumProtocol == TlsProtocolFloor.Tls13 ? "TLS 1.3" : "TLS 1.2+";
-        return $"{string.Join("; ", parts)} ({floor})";
+        return $"{mode} on port {port} ({floor})";
     }
 
     /// <summary>

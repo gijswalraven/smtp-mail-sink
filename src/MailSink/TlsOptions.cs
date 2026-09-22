@@ -12,6 +12,25 @@ public enum TlsProtocolFloor
     Tls13,
 }
 
+/// <summary>How the listener terminates TLS. One port, one mode.</summary>
+/// <remarks>
+/// STARTTLS and implicit TLS cannot share a port: implicit TLS has the client open with a TLS
+/// handshake, STARTTLS has the server open with a plain-text greeting, and nothing can answer
+/// both without sniffing the first byte. So the mode is configuration rather than a second
+/// listener, and a sender is told which one to use.
+/// </remarks>
+public enum SmtpTlsMode
+{
+    /// <summary>Starts in plain text; STARTTLS is required before AUTH. The submission default.</summary>
+    StartTls,
+
+    /// <summary>TLS from the first byte.</summary>
+    Implicit,
+
+    /// <summary>No TLS at all. <b>Development only</b>; refused anywhere else.</summary>
+    None,
+}
+
 /// <summary>
 /// TLS settings, bound from the "MailSink:Tls" configuration section. Required outside
 /// Development, where the sink listens in plain text and loads no certificate at all.

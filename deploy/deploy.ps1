@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Deploys mail sink to Azure Container Instances, with a blob container per account for the .eml
     output.
@@ -83,8 +83,9 @@
     CA to avoid that, and the sink will pick the replacement up on its next restart.
 
 .PARAMETER RetentionHours
-    How long the sink keeps a captured message before deleting it. 0, the default, keeps
-    everything: the container then grows until someone empties it. The sink does the deleting
+    How long the sink keeps a captured message before deleting it. Defaults to 168, a week, on the
+    grounds that a sink accumulating real mail indefinitely is a liability rather than a feature.
+    Pass 0 to keep everything, and empty the containers yourself. The sink does the deleting
     itself, across every container it writes to, so nothing outside the container group has to run
     on a schedule and no lifecycle rule has to be kept in step with this setting.
 
@@ -127,22 +128,28 @@ param(
     # Public only. Must be globally unique within the region.
     [string]$DnsLabel,
 
-    # Not 587 and 465, because Azure Container Instances does not set
+    # Not 587 or 465, because Azure Container Instances does not set
     # net.ipv4.ip_unprivileged_port_start=0 the way Docker does, and the image runs as a non-root
     # user: binding a privileged port there fails with EACCES and the container restarts forever.
     # Verified against ACI. Senders therefore need the port in their configuration; put a load
     # balancer in front if they cannot.
-    [int]$StartTlsPort = 2587,
-    [int]$ImplicitTlsPort = 2465,
+    [int]$Port = 2587,
+
+    # One port, one mode. StartTls begins in plain text and requires STARTTLS before AUTH;
+    # Implicit is TLS from the first byte. They cannot share a port -- implicit TLS has the client
+    # open with a handshake and STARTTLS has the server open with a greeting -- so senders are
+    # told which one this sink speaks.
+    [ValidateSet('StartTls', 'Implicit')]
+    [string]$TlsMode = 'StartTls',
 
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,
 
-    # 0 keeps captured mail forever. Anything else has the sink delete its own .eml blobs once
-    # they reach that age. A year is the ceiling only because a longer one is far more likely to
-    # be a typo than a wish.
+    # A week by default: captured mail is real mail, and keeping it forever is a liability rather
+    # than a feature. 0 keeps everything. A year is the ceiling only because a longer one is far
+    # more likely to be a typo than a wish.
     [ValidateRange(0, 8760)]
-    [int]$RetentionHours = 0,
+    [int]$RetentionHours = 168,
 
     [string]$TimeZone = 'Europe/Amsterdam',
     [string]$Cpu = '0.5',
@@ -376,6 +383,13 @@ if (-not $CertificateSubject) {
 # Nothing to decide any more: outside the Development environment the sink refuses to start
 # without a credential pair and a certificate, and refuses mail from a session that has not used
 # both. The container has no DOTNET_ENVIRONMENT set, so it runs as Production.
+
+# -Force exists for unattended runs, which is exactly where nobody is watching which subscription
+# the az CLI happens to be pointed at. Skipping the confirmation and leaving the target implicit
+# are each defensible; together they deploy a mail sink somewhere nobody chose.
+if ($Force -and -not $PSBoundParameters.ContainsKey('Subscription')) {
+    throw '-Force skips the confirmation prompt, so the target has to be explicit: name -Subscription as well.'
+}
 
 if ($Subscription) {
     Invoke-Az @('account', 'set', '--subscription', $Subscription) | Out-Null
@@ -894,10 +908,14 @@ $environment = [ordered]@{
     # Folder, further down, which is the same value the filesystem would have used.
     'MailSink__Blob__Container'                   = $defaultContainer
     'MailSink__Blob__ManagedIdentityClientId'     = $identityClientId
+    # The sink binds loopback unless told otherwise, which inside a container group would make
+    # it unreachable. TLS is on here, so this is not the unencrypted case that
+    # AllowPlainTextFromAnyAddress guards.
+    'MailSink__ListenAddress'                     = '0.0.0.0'
     # The image already listens on these, but naming them keeps the published ports and the
     # listener from drifting apart when either is changed.
-    'MailSink__StartTlsPorts__0'                  = "$StartTlsPort"
-    'MailSink__ImplicitTlsPorts__0'               = "$ImplicitTlsPort"
+    'MailSink__Port'                              = "$Port"
+    'MailSink__TlsMode'                           = $TlsMode
     # Not published, so it is reachable by the probe and not by a sender.
     'MailSink__HealthPort'                        = "$HealthPort"
     # The sink sweeps the blob container itself; 0 means it deletes nothing.
@@ -952,8 +970,7 @@ else {
 }
 
 $ports = @(
-    [ordered]@{ protocol = 'TCP'; port = $StartTlsPort },
-    [ordered]@{ protocol = 'TCP'; port = $ImplicitTlsPort }
+    [ordered]@{ protocol = 'TCP'; port = $Port }
 )
 
 # The container group is deployed from a file rather than from switches, because a liveness probe
@@ -1057,7 +1074,7 @@ try {
         image       = "$loginServer/$imageTag"
         cpu         = [double]$Cpu
         memory      = [double]$Memory
-        ports       = @([int]$StartTlsPort, [int]$ImplicitTlsPort)
+        ports       = @([int]$Port)
         # The one built above, so the two can no longer drift apart. Keeping a second copy here
         # is what used to make an unchanged deployment recreate itself on every run.
         env         = $environment
@@ -1176,7 +1193,8 @@ else {
     Write-Host "  SMTP host : $ip (private, reachable from $VNetName only)"
 }
 
-Write-Host "  SMTP port : $StartTlsPort (STARTTLS), $ImplicitTlsPort (implicit TLS)"
+$modeSummary = $TlsMode -eq 'Implicit' ? 'implicit TLS, encrypted from the first byte' : 'STARTTLS, required before AUTH'
+Write-Host "  SMTP port : $Port ($modeSummary)"
 
 if ($Accounts) {
     Write-Host "  SMTP users: $(($accountList | ForEach-Object { "$($_.Username) -> $($_.Container)" }) -join ', ')"
