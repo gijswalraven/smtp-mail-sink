@@ -13,7 +13,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="coverlet.collector" Version="10.0.1" />
     <!-- System.Net.Mail.SmtpClient cannot do implicit TLS at all and offers no per-instance
          certificate callback, so the TLS paths are exercised through MailKit instead. -->
     <PackageReference Include="MailKit" Version="4.18.0" />
