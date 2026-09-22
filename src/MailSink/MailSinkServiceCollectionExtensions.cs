@@ -42,13 +42,13 @@ public static class MailSinkServiceCollectionExtensions
         var isDevelopment = environment.IsDevelopment();
         bound.Validate(isDevelopment);
 
-        // An authenticator is registered only when a credential pair is configured, so that a
-        // local run genuinely leaves nothing that accepts credentials rather than only hiding the
-        // AUTH advertisement while an accept-anything authenticator stays wired up behind it.
-        // Outside Development, Validate has already established that there is a pair.
+        // An authenticator is registered only when an account is configured, so that a local run
+        // genuinely leaves nothing that accepts credentials rather than only hiding the AUTH
+        // advertisement while an accept-anything authenticator stays wired up behind it. Outside
+        // Development, Validate has already established that there is at least one account.
         if (bound.HasCredentials)
         {
-            services.AddSingleton<IUserAuthenticator, FixedCredentialUserAuthenticator>();
+            services.AddSingleton<IUserAuthenticator, AccountUserAuthenticator>();
         }
 
         if (!SmtpOptionsFactory.IsPlainText(bound, isDevelopment))

@@ -4,11 +4,33 @@ using System.Text;
 
 namespace MailSink;
 
-/// <summary>Where a captured message is stored: a folder (possibly empty) and a file name.</summary>
-public readonly record struct MailName(string Folder, string FileName)
+/// <summary>
+/// Where a captured message is stored: up to two folder segments and a file name. The segments
+/// are kept apart rather than pre-joined so the writer decides what separator the running
+/// filesystem wants, and neither of them can smuggle one in.
+/// </summary>
+/// <param name="Account">Folder of the account that delivered it; empty when there is none.</param>
+/// <param name="Date">yyyy-MM-dd folder; empty when MailSink:GroupByDate is off.</param>
+public readonly record struct MailName(string Account, string Date, string FileName)
 {
-    public string RelativePath =>
-        string.IsNullOrEmpty(Folder) ? FileName : $"{Folder}/{FileName}";
+    /// <summary>The segments that are actually present, outermost first.</summary>
+    public IEnumerable<string> Folders
+    {
+        get
+        {
+            if (!string.IsNullOrEmpty(Account))
+            {
+                yield return Account;
+            }
+
+            if (!string.IsNullOrEmpty(Date))
+            {
+                yield return Date;
+            }
+        }
+    }
+
+    public string RelativePath => string.Join('/', Folders.Append(FileName));
 
     /// <summary>Same name with a numeric suffix, used when the first choice is already taken.</summary>
     public MailName WithAttempt(int attempt) =>
@@ -43,6 +65,7 @@ public static class MailNaming
 
     public static MailName Build(
         DateTimeOffset receivedAt,
+        string? accountFolder,
         string envelopeFrom,
         IReadOnlyList<string> envelopeTo,
         string? subject,
@@ -57,6 +80,7 @@ public static class MailNaming
         name.Append(".eml");
 
         return new MailName(
+            accountFolder ?? string.Empty,
             groupByDate ? receivedAt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) : string.Empty,
             name.ToString());
 
@@ -121,4 +145,78 @@ public static class MailNaming
     private static bool IsUnsafe(Rune rune) =>
         (rune.IsBmp && ReservedFileNameChars.Contains((char)rune.Value)) ||
         Rune.GetUnicodeCategory(rune) is UnicodeCategory.Control or UnicodeCategory.Format;
+
+    /// <summary>
+    /// Longest an account folder may be, in UTF-8 bytes. Well inside every limit we target; the
+    /// point is only that a folder cannot eat the budget a file name needs.
+    /// </summary>
+    public const int MaxFolderBytes = 64;
+
+    /// <summary>
+    /// Names Windows refuses whatever extension follows them, so a folder called "con" would be
+    /// a startup error on Linux's side of a deployment and an unwritable path on Windows.
+    /// </summary>
+    private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    };
+
+    /// <summary>
+    /// Why <paramref name="folder"/> cannot be a directory under the mail directory, or null when
+    /// it can. An empty folder is valid and means the root.
+    /// </summary>
+    /// <remarks>
+    /// Rejects rather than slugs, unlike everything else here. A subject comes off the wire and
+    /// has to be accepted in whatever shape it arrives; a folder comes from configuration, where
+    /// silently storing mail somewhere other than the name an operator wrote would be worse than
+    /// refusing to start. This is also the only path component the sink does not generate itself,
+    /// so it is the only one that could contain a separator at all.
+    /// </remarks>
+    public static string? DescribeInvalidFolder(string folder)
+    {
+        const string Prefix = "cannot be used as a folder name: it ";
+
+        if (folder.Length == 0)
+        {
+            return null;
+        }
+
+        if (folder.AsSpan().IndexOfAny('/', '\\') >= 0)
+        {
+            return Prefix + "contains a path separator, and an account writes to one folder " +
+                "directly under the mail directory.";
+        }
+
+        if (folder is "." or "..")
+        {
+            return Prefix + "names a relative path rather than a folder.";
+        }
+
+        foreach (var rune in folder.EnumerateRunes())
+        {
+            if (IsUnsafe(rune))
+            {
+                return Prefix + $"contains '{rune}', which is reserved, a control character, or a " +
+                    "format character.";
+            }
+        }
+
+        // Windows strips both, so the folder that ends up on disk is not the one that was
+        // configured -- and then no longer matches what an operator greps for.
+        if (char.IsWhiteSpace(folder[0]) || char.IsWhiteSpace(folder[^1]) || folder[^1] == '.')
+        {
+            return Prefix + "starts or ends with a space or a dot, which Windows strips.";
+        }
+
+        if (ReservedDeviceNames.Contains(folder.Split('.')[0]))
+        {
+            return Prefix + "is a reserved device name on Windows.";
+        }
+
+        return Encoding.UTF8.GetByteCount(folder) > MaxFolderBytes
+            ? Prefix + $"is longer than the {MaxFolderBytes}-byte limit on a folder name."
+            : null;
+    }
 }

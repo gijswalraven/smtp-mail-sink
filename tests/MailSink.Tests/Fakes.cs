@@ -1,5 +1,7 @@
 using MailSink;
 using Microsoft.Extensions.Options;
+using SmtpServer;
+using SmtpServer.IO;
 
 namespace MailSink.Tests;
 
@@ -40,4 +42,33 @@ public static class TestOptions
         configure?.Invoke(options);
         return Options.Create(options);
     }
+}
+
+/// <summary>
+/// Just enough of an SmtpServer session to carry a property bag, which is how the authenticator
+/// hands the account it matched to the message store.
+/// </summary>
+public sealed class FakeSessionContext : ISessionContext
+{
+    public Guid SessionId { get; } = Guid.NewGuid();
+
+    public IServiceProvider ServiceProvider => throw new NotSupportedException();
+
+    public ISmtpServerOptions ServerOptions => throw new NotSupportedException();
+
+    public IEndpointDefinition EndpointDefinition => throw new NotSupportedException();
+
+    public ISecurableDuplexPipe? Pipe { get; set; }
+
+    public AuthenticationContext Authentication { get; set; } = AuthenticationContext.Unauthenticated;
+
+    public IDictionary<string, object> Properties { get; } = new Dictionary<string, object>();
+
+    public event EventHandler<SmtpCommandEventArgs> CommandExecuting { add { } remove { } }
+
+    public event EventHandler<SmtpCommandEventArgs> CommandExecuted { add { } remove { } }
+
+    public event EventHandler<SmtpResponseExceptionEventArgs> ResponseException { add { } remove { } }
+
+    public event EventHandler<EventArgs> SessionAuthenticated { add { } remove { } }
 }

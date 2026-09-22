@@ -75,11 +75,12 @@ needs implicit TLS — or a per-connection certificate callback — wants
 ## File names
 
 ```text
-mail/2026-09-21/100137-883_gijs@example.test_Order-1234-confirmed.eml
-      │          │          │                 └── subject, slugged and capped at 60 bytes
-      │          │          └── first envelope recipient
-      │          └── time received (HHmmss-fff)
-      └── date received
+mail/orders/2026-09-21/100137-883_gijs@example.test_Order-1234-confirmed.eml
+      │      │          │          │                 └── subject, slugged and capped at 60 bytes
+      │      │          │          └── first envelope recipient
+      │      │          └── time received (HHmmss-fff)
+      │      └── date received
+      └── the account that delivered it, when more than one client uses the sink
 ```
 
 A subject that cannot be parsed is simply left out of the name; the message is still stored byte
@@ -102,8 +103,11 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `StartTlsPorts`              | `[587]`     | Require STARTTLS before AUTH.                                   |
 | `ImplicitTlsPorts`           | `[465]`     | TLS from the first byte.                                        |
 | `MaxMessageSize`             | `26214400`  | Bytes. Larger messages are rejected with 552.                   |
-| `Username`                   | *(empty)*   | Required outside `Development`.                                 |
+| `Username`                   | *(empty)*   | Single client. Required outside `Development` unless `Accounts` is set. |
 | `Password`                   | *(empty)*   | Password for `Username`. Required once it is set.               |
+| `Accounts:<name>:Username`   | *(none)*    | Several clients. One credential pair and one folder per account. |
+| `Accounts:<name>:Password`   | *(none)*    | Password for that account. Required.                            |
+| `Accounts:<name>:Folder`     | *(the name)* | Folder its mail goes to. Empty writes to the root.             |
 | `Tls:KeyVaultCertificateUri` | *(empty)*   | Key Vault certificate URI. Required outside `Development`.      |
 | `Tls:MinimumProtocol`        | `Tls12`     | `Tls12` (1.2 and 1.3) or `Tls13` (1.3 only).                    |
 | `Tls:RefreshInterval`        | `01:00:00`  | How often a rotated certificate is re-read.                     |
@@ -135,12 +139,52 @@ Configuring a credential pair makes AUTH mandatory:
 
 Or as environment variables: `MailSink__Username=app`, `MailSink__Password=s3cret`. A `Username`
 without a `Password`, or the other way round, fails at startup rather than quietly going
-unenforced. Outside `Development` the pair is not optional at all.
+unenforced. Outside `Development` credentials are not optional at all.
 
-There is no accept-anything mode and no separate switch to make the credentials bite. With a pair
-configured, `MAIL FROM` is answered `530` until the session has authenticated. Without one — only
-possible in `Development` — no authenticator is registered at all, so there is nothing that could
-accept a wrong password in the first place.
+There is no accept-anything mode and no separate switch to make the credentials bite. With
+credentials configured, `MAIL FROM` is answered `530` until the session has authenticated.
+Without any — only possible in `Development` — no authenticator is registered at all, so there is
+nothing that could accept a wrong password in the first place.
+
+### Several clients
+
+Give each one an account, and its mail lands in its own folder:
+
+```json
+"MailSink": {
+  "Accounts": {
+    "orders": { "Username": "orders-app", "Password": "s3cret", "Folder": "orders" },
+    "crm":    { "Username": "crm-app",    "Password": "hunter2", "Folder": "crm" }
+  }
+}
+```
+
+The key names the account in the startup log and in the vault secrets the deploy script creates.
+`Folder` may be left out, and then it is the key; set it explicitly when the folder and the
+account should not share a name. An empty `Folder` writes to the root of the mail directory,
+which is what a sink that predates accounts already does — so moving an existing `Username` and
+`Password` into an account with `"Folder": ""` changes nothing on disk.
+
+As environment variables, one per line, keyed by the same name:
+
+```text
+MailSink__Accounts__orders__Username=orders-app
+MailSink__Accounts__orders__Password=s3cret
+MailSink__Accounts__orders__Folder=orders
+```
+
+Configuring both `Accounts` and the flat `Username`/`Password` pair is a startup error; so are two
+accounts sharing a username, an account without a password, and a `Folder` that is not a plain
+directory name — anything with a path separator in it, a Windows device name like `con`, a leading
+or trailing space. A folder comes from configuration rather than off the wire, so it is refused
+rather than cleaned up: storing mail somewhere other than the name an operator wrote would be
+worse than not starting.
+
+Folders separate output; they are not an access boundary. Nothing reads mail back out over SMTP,
+but anyone who can reach the share sees every account's folder.
+
+Each AUTH attempt is compared against every configured account, with no early exit, so how long a
+rejection takes does not say which usernames exist.
 
 **AUTH is only ever offered across an encrypted connection.** On a STARTTLS port it is absent from
 the first `EHLO` and appears in the second, after the upgrade. Together with that `530`, this
@@ -193,6 +237,15 @@ that happened to ship with it.
 ```text
 MailSink__Password=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/mailsink-smtp-password)
 ```
+
+With accounts, that is one secret and one reference per account, named after it:
+
+```text
+MailSink__Accounts__orders__Password=@Microsoft.KeyVault(SecretUri=https://<vault>.vault.azure.net/secrets/mailsink-smtp-password-orders)
+```
+
+`Folder` is not a secret and goes on the container group directly, which makes where an account's
+mail lands readable straight off `az container show`.
 
 The sink resolves that at startup through its managed identity, using
 [KeyVaultReferenceResolver](https://github.com/gijswalraven/KeyVaultReferenceResolver) — the same
@@ -267,6 +320,19 @@ you do want a new one. The script prints how to read it back:
 ```powershell
 az keyvault secret show --vault-name <vault> -n mailsink-smtp-password --query value -o tsv
 ```
+
+**Several clients.** Name them with `-Accounts` instead, and each gets a username, a generated
+password and a folder on the share:
+
+```powershell
+./deploy/deploy.ps1 -Accounts orders, crm
+```
+
+The name is the username, the folder and the suffix of both vault secrets
+(`mailsink-smtp-password-orders`), so it is held to letters, digits and hyphens. Every run must
+name every account: the container group is deployed with exactly the accounts listed, so leaving
+one out removes its credentials from the sink — the mail it already delivered stays on the share.
+`-RotatePassword` rotates all of them.
 
 The container receives a vault reference, not the secret, and resolves it through a user-assigned
 managed identity granted `Key Vault Secrets User`. Nothing sensitive reaches a command line, the
@@ -361,8 +427,10 @@ dotnet test
 - **`SmtpOptionsFactory`** — that the endpoint wiring matches the environment: which ports open,
   which are secure, and that every deployed endpoint requires AUTH, refuses it unencrypted, and
   pins the protocol floor.
-- **`FixedCredentialUserAuthenticator`** — the credential comparison on its own, so the wrong-pair
-  cases are asserted without a socket.
+- **`AccountUserAuthenticator`** — the credential comparison on its own, so the wrong-pair cases
+  are asserted without a socket, including one account's username with another's password.
+- **`MailSinkOptions`** — the account rules: duplicate usernames, a missing password, and every
+  shape of folder name the filesystem would not take.
 - **`MailRetentionService`** — a sweep over a real temp folder with a `FakeTimeProvider`: what
   goes at the age boundary, that a non-`.eml` file and an emptied account folder stay, and that
   advancing the clock past the interval sweeps again.

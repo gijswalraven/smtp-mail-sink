@@ -52,14 +52,28 @@ public sealed class MailSinkOptions
     public int MaxMessageSize { get; set; } = 25 * 1024 * 1024;
 
     /// <summary>
-    /// Username AUTH must present. Required outside Development. In Development it is optional:
-    /// leave it empty and the sink advertises no AUTH and accepts mail from anyone, which is the
-    /// point of running one locally.
+    /// Shorthand for a single account that writes to the root of the mail directory, which is
+    /// the whole configuration a one-client sink needs. Mutually exclusive with
+    /// <see cref="Accounts"/>. Required outside Development unless accounts are configured; in
+    /// Development both may be left out, and the sink then advertises no AUTH and accepts mail
+    /// from anyone, which is the point of running one locally.
     /// </summary>
     public string Username { get; set; } = string.Empty;
 
     /// <summary>Password that goes with <see cref="Username"/>. Required once a username is set.</summary>
     public string Password { get; set; } = string.Empty;
+
+    /// <summary>
+    /// The accounts the sink accepts, keyed by a name that identifies each one in logs and in
+    /// configuration. Each writes to its own <see cref="MailAccount.Folder"/>, so several clients
+    /// can share a sink without sharing a directory.
+    /// </summary>
+    /// <remarks>
+    /// A dictionary rather than an array: keys are stable, so one account can be overridden by a
+    /// single environment variable without knowing its position, and the binder's habit of
+    /// appending to array defaults cannot apply.
+    /// </remarks>
+    public Dictionary<string, MailAccount> Accounts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>TLS settings. Required outside Development.</summary>
     public TlsOptions Tls { get; set; } = new();
@@ -67,8 +81,21 @@ public sealed class MailSinkOptions
     /// <summary>How long captured mail is kept. Off unless an age is configured.</summary>
     public RetentionOptions Retention { get; set; } = new();
 
-    /// <summary>True when a credential pair is configured, and so when AUTH is advertised.</summary>
-    public bool HasCredentials => !string.IsNullOrEmpty(Username);
+    /// <summary>True when at least one account is configured, and so when AUTH is advertised.</summary>
+    public bool HasCredentials => !string.IsNullOrEmpty(Username) || Accounts.Count > 0;
+
+    /// <summary>
+    /// Every account the sink accepts, with its folder resolved. Flattens the two ways of
+    /// configuring one so nothing downstream has to know which was used.
+    /// </summary>
+    public IReadOnlyList<ResolvedAccount> ResolveAccounts() =>
+        !string.IsNullOrEmpty(Username)
+            ? [new ResolvedAccount(Username, Username, Password, string.Empty)]
+            : [.. Accounts.Select(entry => new ResolvedAccount(
+                entry.Key,
+                entry.Value.Username,
+                entry.Value.Password,
+                entry.Value.FolderOrKey(entry.Key)))];
 
     /// <summary>
     /// Connections served at once; further connections are dropped until one finishes. Each
@@ -116,19 +143,30 @@ public sealed class MailSinkOptions
     /// </param>
     public void Validate(bool isDevelopment)
     {
-        if (HasCredentials && string.IsNullOrEmpty(Password))
+        var hasFlatPair = !string.IsNullOrEmpty(Username);
+
+        if (hasFlatPair && Accounts.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "MailSink:Username and MailSink:Accounts both configure credentials, and there is " +
+                "no honest way to honour both. Move the pair into MailSink:Accounts; an account " +
+                "with an empty Folder writes exactly where the flat pair does.");
+        }
+
+        if (hasFlatPair && string.IsNullOrEmpty(Password))
         {
             throw new InvalidOperationException(
                 "MailSink:Password is required when MailSink:Username is set; a username on its own " +
                 "would accept any password.");
         }
 
-        if (!HasCredentials && !string.IsNullOrEmpty(Password))
+        if (!hasFlatPair && Accounts.Count == 0 && !string.IsNullOrEmpty(Password))
         {
             throw new InvalidOperationException(
                 "MailSink:Password is set without MailSink:Username, so nothing would enforce it.");
         }
 
+        ValidateAccounts();
         ValidateRetention();
 
         if (isDevelopment)
@@ -139,9 +177,9 @@ public sealed class MailSinkOptions
         if (!HasCredentials)
         {
             throw new InvalidOperationException(
-                "MailSink:Username and MailSink:Password are required outside the Development " +
-                "environment. The sink does not accept unauthenticated mail in a deployed " +
-                "environment; see SECURITY.md.");
+                "MailSink:Accounts, or the MailSink:Username and MailSink:Password pair, is " +
+                "required outside the Development environment. The sink does not accept " +
+                "unauthenticated mail in a deployed environment; see SECURITY.md.");
         }
 
         if (!Tls.IsConfigured)
@@ -179,6 +217,69 @@ public sealed class MailSinkOptions
             throw new InvalidOperationException(
                 $"{SectionName}:Retention:SweepInterval has to be positive; an interval of zero " +
                 "would sweep the mail directory in a loop.");
+        }
+    }
+
+    /// <summary>
+    /// Checks each account can do what it says and that no two of them collide. Folder names are
+    /// the reason this is not optional: they come from configuration rather than from a message,
+    /// and they are the first thing the sink puts in a path that it did not generate itself.
+    /// </summary>
+    private void ValidateAccounts()
+    {
+        var usernames = new HashSet<string>(StringComparer.Ordinal);
+        var folders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (key, account) in Accounts)
+        {
+            var path = $"{SectionName}:Accounts:{key}";
+
+            if (string.IsNullOrEmpty(account.Username))
+            {
+                throw new InvalidOperationException($"{path}:Username is required.");
+            }
+
+            if (string.IsNullOrEmpty(account.Password))
+            {
+                throw new InvalidOperationException(
+                    $"{path}:Password is required; an account without one would accept any password.");
+            }
+
+            // Ordinal, because the authenticator compares byte for byte. Two accounts sharing a
+            // username would make the account a session authenticated as a matter of which entry
+            // the comparison loop happened to see last.
+            if (!usernames.Add(account.Username))
+            {
+                throw new InvalidOperationException(
+                    $"{path}:Username '{account.Username}' is already used by another account. " +
+                    "Usernames have to be unique, or there is no telling which account a session is.");
+            }
+
+            var folder = account.FolderOrKey(key);
+
+            if (MailNaming.DescribeInvalidFolder(folder) is { } problem)
+            {
+                var source = account.Folder is null
+                    ? $"The account key '{key}', used as its folder because {path}:Folder is not set,"
+                    : $"{path}:Folder '{folder}'";
+
+                throw new InvalidOperationException($"{source} {problem}");
+            }
+
+            // Two accounts may deliberately share a folder -- an application and its test harness,
+            // say, with separate credentials and one destination. Folders that differ only in case
+            // are not that: they would be two directories on Linux and one on Windows and Azure
+            // Files, so whichever was meant, one of the two platforms gets it wrong.
+            if (folder.Length > 0 &&
+                folders.TryGetValue(folder, out var other) &&
+                !string.Equals(folder, other, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"{path}:Folder '{folder}' differs from '{other}' only in case. That is one " +
+                    "directory on Windows and Azure Files and two on Linux.");
+            }
+
+            folders[folder] = folder;
         }
     }
 }

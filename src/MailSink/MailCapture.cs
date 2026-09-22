@@ -20,6 +20,7 @@ public sealed class MailCapture(
         var metadata = metadataReader.Read(message.Raw);
         var name = MailNaming.Build(
             timeProvider.GetLocalNow(),
+            message.AccountFolder,
             message.From,
             message.To,
             metadata.Subject,

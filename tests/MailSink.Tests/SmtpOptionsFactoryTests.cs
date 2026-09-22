@@ -199,7 +199,7 @@ public class SmtpOptionsFactoryTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
 
-        Assert.Contains("MailSink:Username and MailSink:Password are required", ex.Message);
+        Assert.Contains("MailSink:Accounts, or the MailSink:Username and MailSink:Password pair, is", ex.Message);
     }
 
     [Fact]

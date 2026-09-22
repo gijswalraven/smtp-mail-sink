@@ -36,15 +36,29 @@
     -CertificateSubject to issue it for the name your senders will actually use instead.
 
 .PARAMETER SmtpUsername
-    Username the sink will require. Stored in the key vault alongside the password.
+    Username the sink will require, for a sink with one client. Stored in the key vault alongside
+    the password. Its mail goes to the root of the file share. Ignored when -Accounts is given.
 
 .PARAMETER SmtpPassword
     Password the sink will require. Omit it and a 32-character random one is generated on the
     first run and kept in the key vault; later runs reuse it. The script prints the command to
-    read it back, rather than the password itself.
+    read it back, rather than the password itself. Only valid for a single account.
+
+.PARAMETER Accounts
+    Names of the accounts the sink will accept, for several clients sharing one sink. Each gets
+    its own credential pair -- username and generated password, both in the key vault -- and its
+    own folder on the file share, so one client's mail never lands among another's.
+
+    The name is the username, the folder, and the suffix of the vault secrets, so keep it to
+    letters, digits and hyphens. Use -SmtpUsername instead when there is only one client.
+
+    Every run must name every account: the container group is deployed with exactly the accounts
+    listed here, so leaving one out removes its credentials from the sink. The mail it already
+    delivered stays on the share.
 
 .PARAMETER RotatePassword
     Replace the stored password with a freshly generated one, even though a secret already exists.
+    With -Accounts, every listed account is rotated.
 
 .PARAMETER CertificateSubject
     Host name the TLS certificate is issued for. Defaults to the container group's public FQDN for
@@ -70,6 +84,9 @@
 
 .EXAMPLE
     ./deploy.ps1 -Exposure Public -DnsLabel mailsink-demo
+
+.EXAMPLE
+    ./deploy.ps1 -Accounts orders, crm
 
 .EXAMPLE
     ./deploy.ps1 -ResourceGroup rg-other -Location northeurope
@@ -123,6 +140,10 @@ param(
     [string]$SmtpUsername = 'mailsink',
     [string]$SmtpPassword,
     [switch]$RotatePassword,
+
+    # Several clients instead of one: a credential pair and a folder per name. Supersedes
+    # -SmtpUsername, which is the single-client shorthand.
+    [string[]]$Accounts = @(),
 
     # Empty means "derive from -Exposure": the public FQDN, or <prefix>.internal when private.
     [string]$CertificateSubject,
@@ -387,6 +408,50 @@ $usernameSecret = 'mailsink-smtp-username'
 $passwordSecret = 'mailsink-smtp-password'
 $tlsCertificate = 'mailsink-smtp-tls'
 
+# One entry per credential pair the sink will accept, so everything below -- the vault secrets,
+# the container's environment, the summary -- is written once against a list rather than twice
+# against two shapes of the same thing.
+#
+# A key vault secret name may only hold letters, digits and hyphens, and the sink refuses a
+# folder that is not a plain directory name, so the account name is held to the intersection of
+# both rather than mapped into them. A name that has to be mangled to fit is better rejected
+# here than silently turned into something an operator did not write.
+if ($Accounts) {
+    if ($SmtpPassword) {
+        throw '-SmtpPassword sets one password and -Accounts creates several. Let the script generate them, and read them back from the vault.'
+    }
+
+    $duplicates = $Accounts | Group-Object | Where-Object Count -gt 1
+    if ($duplicates) {
+        throw "-Accounts lists '$($duplicates[0].Name)' more than once."
+    }
+
+    $accountList = foreach ($name in $Accounts) {
+        if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,30}$') {
+            throw "-Accounts entry '$name' must be 1-31 letters, digits or hyphens, starting with a letter or digit. It is used as a username, a folder name and a key vault secret name."
+        }
+
+        [pscustomobject]@{
+            Key            = $name
+            Username       = $name
+            Folder         = $name
+            UsernameSecret = "$usernameSecret-$name"
+            PasswordSecret = "$passwordSecret-$name"
+        }
+    }
+}
+else {
+    # The single-client shape: no folder, so its mail lands in the root of the share exactly as
+    # it did before accounts existed.
+    $accountList = @([pscustomobject]@{
+            Key            = $SmtpUsername
+            Username       = $SmtpUsername
+            Folder         = $null
+            UsernameSecret = $usernameSecret
+            PasswordSecret = $passwordSecret
+        })
+}
+
 if ($storageName.Length -gt 24) { throw "-NamePrefix is too long; the storage account name '$storageName' exceeds 24 characters." }
 if ($vaultName.Length -gt 24) { throw "-NamePrefix is too long; the key vault name '$vaultName' exceeds 24 characters." }
 
@@ -577,39 +642,46 @@ Grant-Role -PrincipalId $callerObjectId -Role 'Key Vault Secrets Officer' -Scope
 # looked at the data plane is known to work. That matters for Test-VaultSecret, whose "not found"
 # would otherwise be indistinguishable from "not allowed yet" and would regenerate a password
 # that already exists.
-$currentUsername = & az keyvault secret show --vault-name $vaultName -n $usernameSecret --query value -o tsv 2>$null
-$global:LASTEXITCODE = 0
-
-if ($currentUsername -ne $SmtpUsername) {
-    Set-VaultSecret -VaultName $vaultName -Name $usernameSecret -Value $SmtpUsername
-}
-else {
-    Write-Host "    username '$SmtpUsername' already stored"
-}
-
-$passwordExists = Test-VaultSecret -VaultName $vaultName -Name $passwordSecret
-
-if ($SmtpPassword) {
-    $secretValue = $SmtpPassword
-    Write-Host '    storing the password from -SmtpPassword'
-}
-elseif ($RotatePassword) {
-    $secretValue = New-SmtpPassword
-    Write-Host '    rotating to a newly generated password'
-}
-elseif (-not $passwordExists) {
-    $secretValue = New-SmtpPassword
-    Write-Host '    generating a password (32 random alphanumeric characters)'
-}
-else {
-    # Re-running must not silently change the credential every deployed sender is configured with.
-    $secretValue = $null
-    Write-Host '    keeping the password already in the vault'
-}
-
 try {
-    if ($secretValue) {
-        Set-VaultSecret -VaultName $vaultName -Name $passwordSecret -Value $secretValue
+    foreach ($account in $accountList) {
+        $label = if ($accountList.Count -gt 1) { "[$($account.Key)] " } else { '' }
+
+        $currentUsername = & az keyvault secret show --vault-name $vaultName -n $account.UsernameSecret --query value -o tsv 2>$null
+        $global:LASTEXITCODE = 0
+
+        if ($currentUsername -ne $account.Username) {
+            Set-VaultSecret -VaultName $vaultName -Name $account.UsernameSecret -Value $account.Username
+        }
+        else {
+            Write-Host "    $($label)username '$($account.Username)' already stored"
+        }
+
+        $passwordExists = Test-VaultSecret -VaultName $vaultName -Name $account.PasswordSecret
+
+        if ($SmtpPassword) {
+            $secretValue = $SmtpPassword
+            Write-Host "    $($label)storing the password from -SmtpPassword"
+        }
+        elseif ($RotatePassword) {
+            $secretValue = New-SmtpPassword
+            Write-Host "    $($label)rotating to a newly generated password"
+        }
+        elseif (-not $passwordExists) {
+            $secretValue = New-SmtpPassword
+            Write-Host "    $($label)generating a password (32 random alphanumeric characters)"
+        }
+        else {
+            # Re-running must not silently change the credential every deployed sender is
+            # configured with.
+            $secretValue = $null
+            Write-Host "    $($label)keeping the password already in the vault"
+        }
+
+        if ($secretValue) {
+            Set-VaultSecret -VaultName $vaultName -Name $account.PasswordSecret -Value $secretValue
+        }
+
+        $secretValue = $null
     }
 }
 finally {
@@ -649,8 +721,6 @@ if (Grant-Role -PrincipalId $principalId -Role 'Key Vault Certificate User' -Sco
 }
 
 # The container is handed vault URIs, not secrets. Versionless, so restarting picks up a rotation.
-$usernameReference = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$usernameSecret)"
-$passwordReference = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$passwordSecret)"
 $certificateUri = "https://$vaultHost/certificates/$tlsCertificate"
 
 $environment = [ordered]@{
@@ -664,8 +734,6 @@ $environment = [ordered]@{
     # The sink sweeps the mounted share itself; 0 means it deletes nothing.
     'MailSink__Retention__MaxAge'                 = ([timespan]::FromHours($RetentionHours)).ToString()
     'TZ'                                          = $TimeZone
-    'MailSink__Username'                          = $usernameReference
-    'MailSink__Password'                          = $passwordReference
     # Not a secret: the certificate's private key is fetched through the managed identity.
     'MailSink__Tls__KeyVaultCertificateUri'       = $certificateUri
     # Naming the one vault the sink may read means a reference pointing anywhere else is refused
@@ -673,6 +741,22 @@ $environment = [ordered]@{
     'MailSink__KeyVault__AllowedHosts__0'         = $vaultHost
     # A container group can carry several identities; the default credential cannot guess.
     'MailSink__KeyVault__ManagedIdentityClientId' = $identityClientId
+}
+
+# The credentials, as references rather than values. MailSink:Username and MailSink:Accounts are
+# mutually exclusive in the sink, so exactly one of these two shapes is emitted.
+if ($Accounts) {
+    foreach ($account in $accountList) {
+        $environment["MailSink__Accounts__$($account.Key)__Username"] = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$($account.UsernameSecret))"
+        $environment["MailSink__Accounts__$($account.Key)__Password"] = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$($account.PasswordSecret))"
+        # Not a secret, and the one thing here worth reading straight off the container group:
+        # it is the difference between mail that is missing and mail that is somewhere else.
+        $environment["MailSink__Accounts__$($account.Key)__Folder"] = $account.Folder
+    }
+}
+else {
+    $environment['MailSink__Username'] = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$usernameSecret)"
+    $environment['MailSink__Password'] = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$passwordSecret)"
 }
 
 if ($UseAdminCredentials) {
@@ -926,7 +1010,14 @@ else {
 }
 
 Write-Host "  SMTP port : $StartTlsPort (STARTTLS), $ImplicitTlsPort (implicit TLS)"
-Write-Host "  SMTP user : $SmtpUsername"
+
+if ($Accounts) {
+    Write-Host "  SMTP users: $(($accountList | ForEach-Object { "$($_.Username) -> $($_.Folder)/" }) -join ', ')"
+}
+else {
+    Write-Host "  SMTP user : $SmtpUsername"
+}
+
 Write-Host '  Auth      : required, over TLS only'
 Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
 Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
@@ -936,9 +1027,11 @@ $retentionSummary = $RetentionHours -eq 0 `
     : "$RetentionHours h, swept hourly by the sink itself"
 Write-Host "  Retention : $retentionSummary"
 Write-Host ''
-Write-Host 'The password is in the key vault; the container reads it through its managed identity.'
-Write-Host 'Read it back when you need to configure a sender:'
-Write-Host "  az keyvault secret show --vault-name $vaultName -n $passwordSecret --query value -o tsv"
+Write-Host 'The passwords are in the key vault; the container reads them through its managed identity.'
+Write-Host 'Read one back when you need to configure a sender:'
+foreach ($account in $accountList) {
+    Write-Host "  az keyvault secret show --vault-name $vaultName -n $($account.PasswordSecret) --query value -o tsv"
+}
 Write-Host ''
 Write-Host 'The certificate is self-signed, so senders must be told to trust it. Export the public'
 Write-Host 'half and install it wherever the sending application keeps its trusted roots:'

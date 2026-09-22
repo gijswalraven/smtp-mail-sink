@@ -131,10 +131,23 @@ public sealed class SmtpListenerService(
     /// One line for the startup log, so a misconfigured credential pair shows up immediately
     /// rather than as an unexplained 535 in the sending application.
     /// </summary>
-    private static string DescribeAuthentication(MailSinkOptions options) =>
-        options.HasCredentials
-            ? $"required, credentials for '{options.Username}'"
-            : "none -- mail is accepted from anyone";
+    private static string DescribeAuthentication(MailSinkOptions options)
+    {
+        var accounts = options.ResolveAccounts();
+
+        return accounts.Count switch
+        {
+            0 => "none -- mail is accepted from anyone",
+            1 => $"required, credentials for '{accounts[0].Key}'{DescribeFolder(accounts[0])}",
+            _ => $"required, {accounts.Count} accounts: " +
+                 string.Join(", ", accounts.Select(account => account.Key + DescribeFolder(account))),
+        };
+
+        // The folder is worth a startup log line of its own: it is the difference between mail
+        // that is missing and mail that is somewhere else.
+        static string DescribeFolder(ResolvedAccount account) =>
+            account.Folder.Length == 0 ? string.Empty : $" -> {account.Folder}/";
+    }
 
     /// <summary>
     /// Drops the connection when the sink is already serving as many sessions as it is willing

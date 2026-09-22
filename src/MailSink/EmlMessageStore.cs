@@ -22,7 +22,8 @@ public sealed class EmlMessageStore(IMailCapture capture) : MessageStore
             Raw: buffer.ToArray(),
             From: Format(transaction.From),
             To: [.. transaction.To.Select(Format)],
-            ClientAddress: SessionClient.Describe(context));
+            ClientAddress: SessionClient.Describe(context),
+            AccountFolder: SessionAccount.Folder(context));
 
         var result = await capture.CaptureAsync(message, cancellationToken);
 

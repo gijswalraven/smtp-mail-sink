@@ -21,15 +21,29 @@ public sealed class FileMailWriter : IMailWriter
         _root = options.Value.ResolveMailDirectory(environment.ContentRootPath);
         _rootPrefix = Path.TrimEndingDirectorySeparator(_root) + Path.DirectorySeparatorChar;
         Directory.CreateDirectory(_root);
+
+        // Each account's folder is created up front rather than on its first message, so the
+        // layout an operator expects is there to look at from the start, and so a name the
+        // filesystem refuses fails the host instead of failing a delivery hours later.
+        foreach (var account in options.Value.ResolveAccounts())
+        {
+            if (account.Folder.Length > 0)
+            {
+                Directory.CreateDirectory(EnsureUnderRoot(Path.Combine(_root, account.Folder)));
+            }
+        }
     }
 
     public string Destination => _root;
 
     public async Task<string> WriteAsync(MailName name, byte[] raw, CancellationToken cancellationToken)
     {
-        var directory = string.IsNullOrEmpty(name.Folder)
-            ? _root
-            : EnsureUnderRoot(Path.Combine(_root, name.Folder));
+        // Up to two segments now -- the account's folder and the date's -- and neither reaches
+        // Path.Combine already joined, so a separator inside one cannot pass for a boundary
+        // between them.
+        var directory = name.Folders.Any()
+            ? EnsureUnderRoot(Path.Combine([_root, .. name.Folders]))
+            : _root;
 
         Directory.CreateDirectory(directory);
 

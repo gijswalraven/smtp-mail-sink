@@ -170,7 +170,13 @@ internal sealed class TestSink : IAsyncDisposable
     }
 
     /// <summary>Waits for the one .eml file the test expects and returns its path.</summary>
-    public async Task<string> WaitForSingleFileAsync()
+    public async Task<string> WaitForSingleFileAsync() => Assert.Single(await WaitForFilesAsync(1));
+
+    /// <summary>
+    /// Waits for <paramref name="count"/> .eml files anywhere under the mail directory and
+    /// returns them, sorted, so a test can assert on the folders they landed in.
+    /// </summary>
+    public async Task<string[]> WaitForFilesAsync(int count)
     {
         // The SMTP reply comes after the write, but the directory listing can lag on Windows.
         for (var attempt = 0; attempt < 50; attempt++)
@@ -178,17 +184,23 @@ internal sealed class TestSink : IAsyncDisposable
             if (Directory.Exists(MailDirectory))
             {
                 var files = Directory.GetFiles(MailDirectory, "*.eml", SearchOption.AllDirectories);
-                if (files.Length > 0)
+                if (files.Length >= count)
                 {
-                    return Assert.Single(files);
+                    Array.Sort(files, StringComparer.Ordinal);
+                    return files;
                 }
             }
 
             await Task.Delay(100);
         }
 
-        throw new Xunit.Sdk.XunitException($"No .eml file appeared under {MailDirectory}.");
+        throw new Xunit.Sdk.XunitException(
+            $"Fewer than {count} .eml file(s) appeared under {MailDirectory}.");
     }
+
+    /// <summary>The path of <paramref name="file"/> relative to the mail directory, with '/'.</summary>
+    public string RelativePathOf(string file) =>
+        Path.GetRelativePath(MailDirectory, file).Replace(Path.DirectorySeparatorChar, '/');
 
     /// <summary>
     /// Asserts nothing was captured. Waits first, so a message that is merely slow does not pass

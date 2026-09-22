@@ -73,7 +73,7 @@ public class MailCaptureTests
         await Create(writer, configure: o => o.GroupByDate = false)
             .CaptureAsync(Message(), CancellationToken.None);
 
-        Assert.Equal(string.Empty, Assert.Single(writer.Written).Name.Folder);
+        Assert.Equal(string.Empty, Assert.Single(writer.Written).Name.Date);
     }
 
     [Fact]
@@ -99,5 +99,30 @@ public class MailCaptureTests
         Assert.False(result.Succeeded);
         Assert.Equal("disk full", result.Error);
         Assert.Null(result.Location);
+    }
+
+    [Fact]
+    public async Task Capture_files_a_message_under_the_account_that_delivered_it()
+    {
+        var writer = new InMemoryMailWriter();
+        var message = new IncomingMessage(
+            [1], "app@example.test", ["gijs@example.test"], AccountFolder: "orders");
+
+        await Create(writer).CaptureAsync(message, CancellationToken.None);
+
+        Assert.Equal(
+            "orders/2026-09-21/102357-243_gijs@example.test_Order-confirmed.eml",
+            Assert.Single(writer.Written).Name.RelativePath);
+    }
+
+    [Fact]
+    public async Task Capture_writes_to_the_root_when_the_session_had_no_account()
+    {
+        // Only reachable in Development, where the sink may run with no accounts at all.
+        var writer = new InMemoryMailWriter();
+
+        await Create(writer).CaptureAsync(Message(), CancellationToken.None);
+
+        Assert.Equal(string.Empty, Assert.Single(writer.Written).Name.Account);
     }
 }
