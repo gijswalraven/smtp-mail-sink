@@ -13,13 +13,11 @@ COPY --from=build /app .
 ENV MailSink__MailDirectory=/mail
 VOLUME /mail
 
-# The sink defaults to 587 and 465, but both are privileged and this image runs as a non-root
-# user, which may not bind them. So the container listens high and the host publishes whichever
-# port clients should see -- "-p 587:2587" for Docker, --ports for a container group. A host that
-# can bind privileged ports directly (the Windows service, a VM) should use the 587/465 defaults.
-ENV MailSink__StartTlsPorts__0=2587
-ENV MailSink__ImplicitTlsPorts__0=2465
-EXPOSE 2587 2465
+# The standard submission ports. Both are privileged and this image runs as a non-root user, but
+# container runtimes set net.ipv4.ip_unprivileged_port_start=0, so binding them needs no extra
+# capability -- verified against this image. A runtime that does not do that will fail to bind;
+# point MailSink__StartTlsPorts__0 and MailSink__ImplicitTlsPorts__0 at high ports if so.
+EXPOSE 587 465
 
 # The plain-text port, opened only in the Development environment.
 EXPOSE 1025

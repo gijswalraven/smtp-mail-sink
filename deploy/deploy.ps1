@@ -91,10 +91,11 @@ param(
     # Public only. Must be globally unique within the region.
     [string]$DnsLabel,
 
-    # Both submission ports are privileged, and the container runs as a non-root user that may
-    # not bind them, so the sink listens high and the container group publishes these.
-    [int]$StartTlsPort = 2587,
-    [int]$ImplicitTlsPort = 2465,
+    # The standard submission ports. Privileged, but a container runtime sets
+    # net.ipv4.ip_unprivileged_port_start=0, so the non-root user in the image binds them fine.
+    # Move them high if a runtime ever refuses.
+    [int]$StartTlsPort = 587,
+    [int]$ImplicitTlsPort = 465,
 
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,

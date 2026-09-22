@@ -229,10 +229,9 @@ Docker's port publishing bypasses the host firewall, so binding every interface 
 whole LAN an open sink. The container runs as a non-root user.
 
 To run the deployed posture under Docker instead, drop `DOTNET_ENVIRONMENT`, set
-`MailSink__Tls__KeyVaultCertificateUri` and the credentials, and publish the TLS ports. Note that
-the image listens on `2587` and `2465` rather than `587` and `465`: both of those are privileged,
-and the container deliberately does not run as root, so it listens high and you map the port
-clients should see — `-p 587:2587`.
+`MailSink__Tls__KeyVaultCertificateUri` and the credentials, and publish `587` and `465`. The
+image binds those directly even though it runs as a non-root user, because container runtimes set
+`net.ipv4.ip_unprivileged_port_start=0`.
 
 ## Azure (Container Instances)
 
@@ -284,11 +283,6 @@ container's identity the two roles needed to read it. Its subject is the public 
 is self-signed, senders have to be told to trust it — the script prints the
 `az keyvault certificate download` command for that. Replace the certificate in the vault with one
 from your own CA and the sink picks the replacement up on its next refresh.
-
-**Ports.** `-StartTlsPort` defaults to `2587` and `-ImplicitTlsPort` to `2465`, not the standard
-`587` and `465`, because the container runs as a non-root user that may not bind a privileged
-port and ACI publishes the container's port as-is. Senders therefore need the port in their
-configuration. Front the group with a load balancer if you need the standard numbers.
 
 **Exposure.** The default is `-Exposure Private`: the container group sits in a VNet with no public
 IP, reachable from that VNet, peered networks, or over VPN. `-Exposure Public -DnsLabel <label>`
