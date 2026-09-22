@@ -32,9 +32,9 @@
       },
       "KeyVaultReferenceResolver": {
         "type": "Direct",
-        "requested": "[2.0.0, )",
-        "resolved": "2.0.0",
-        "contentHash": "+lXRmkyoWnZjey0+OQWsk2fBeYLcIupsKbIaqDAgXp7BbCRch8Y6wAP3tR+HtAzFFdwfVyFWYlmgN66Jfzg6eQ==",
+        "requested": "[2.0.1, )",
+        "resolved": "2.0.1",
+        "contentHash": "kxgWBbFH7y7d2kqt06pVivKEstOG+Y8AobgXgEyFesboAjHuuRfG7KwX7waCsm+LycBrJXnWgKa3piweMkEjpQ==",
         "dependencies": {
           "Azure.Identity": "1.21.0",
           "Azure.Security.KeyVault.Secrets": "4.11.1",
