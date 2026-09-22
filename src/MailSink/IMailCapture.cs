@@ -13,7 +13,8 @@ public sealed record IncomingMessage(
     string From,
     IReadOnlyList<string> To,
     string? ClientAddress = null,
-    string AccountFolder = "");
+    string AccountFolder = "",
+    string Account = "");
 
 public sealed record CaptureResult(bool Succeeded, string? Location, string? Error)
 {

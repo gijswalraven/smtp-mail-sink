@@ -38,17 +38,35 @@ public sealed class MailCapture(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Could not store message from {From} as {Name}", message.From, name.RelativePath);
+            logger.LogError(
+                ex,
+                "Could not store message from {From} as {Name} for account {Account} at {Client}",
+                message.From,
+                name.RelativePath,
+                Describe(message.Account),
+                Describe(message.ClientAddress));
             return CaptureResult.Failed(ex.Message);
         }
 
+        // The account and the client address are here so that a stored message can be tied back
+        // to who delivered it and from where. Without them the only record of a session is the
+        // warning a failed AUTH writes, which says nothing about the ones that succeeded.
         logger.LogInformation(
-            "Saved {Bytes} bytes from {From} to {To} -> {Location}",
+            "Saved {Bytes} bytes from {From} to {To} for account {Account} at {Client} -> {Location}",
             message.Raw.Length,
             message.From,
             string.Join(", ", message.To),
+            Describe(message.Account),
+            Describe(message.ClientAddress),
             location);
 
         return CaptureResult.Stored(location);
     }
+
+    /// <summary>
+    /// Keeps an absent account or address out of the log as a readable word rather than an empty
+    /// string, which reads as though the field were missing rather than genuinely unknown.
+    /// </summary>
+    private static string Describe(string? value) =>
+        string.IsNullOrEmpty(value) ? "(none)" : value;
 }
