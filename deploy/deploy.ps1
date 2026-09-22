@@ -15,16 +15,14 @@
     managed identity, so neither credential appears on a command line or in the ARM definition of
     the container group.
 
-    No secret is written to disk: the storage key and the registry password are fetched at run time
-    into variables and cleared again at the end. The generated SMTP password reaches "az keyvault
-    secret set" through a temporary file that is deleted immediately afterwards, because --value
-    would put it on a command line.
+    No secret reaches a command line. The generated SMTP password goes to "az keyvault secret set"
+    through a temporary file, because --value would put it on one. The storage account key and the
+    registry password travel the same way: the container group is deployed from a generated JSON
+    file rather than from switches, and that file is deleted as soon as the call returns.
 
-    They are, unavoidably, passed as arguments to the single `az container create` call -- ARM has
-    to receive them and az exposes no environment-variable equivalent for either. Command lines are
-    readable by other local users, so treat a shared or untrusted deploy machine accordingly. This
-    is a one-shot interactive call; purge-old-mail.ps1 keeps the key out of command lines entirely,
-    which matters more there because its scheduled task re-runs unattended every hour.
+    Deploying from a file is also the only way to declare a liveness probe -- ACI offers no CLI
+    switch for one -- so the container group is restarted when the sink stops answering on its
+    health endpoint rather than being left wedged.
 
 .PARAMETER Exposure
     Private (default) puts the container group in a VNet with no public IP. Only reachable from
@@ -98,6 +96,9 @@ param(
     [int]$StartTlsPort = 2587,
     [int]$ImplicitTlsPort = 2465,
 
+    # Not published. The liveness probe reaches it inside the container group; a sender cannot.
+    [int]$HealthPort = 8080,
+
     [string]$TimeZone = 'Europe/Amsterdam',
     [string]$Cpu = '0.5',
     [string]$Memory = '1',
@@ -130,13 +131,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-
-# Wraps a value in literal double quotes so cmd.exe (az is az.cmd on Windows) treats it as a
-# single token rather than parsing characters like ( ) & inside it.
-function Quote {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-    return '"' + $Value + '"'
-}
 
 function Invoke-Az {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -645,51 +639,33 @@ $usernameReference = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$
 $passwordReference = "@Microsoft.KeyVault(SecretUri=https://$vaultHost/secrets/$passwordSecret)"
 $certificateUri = "https://$vaultHost/certificates/$tlsCertificate"
 
-$containerArgs = @(
-    'container', 'create',
-    '-g', $ResourceGroup,
-    '-n', $containerGroup,
-    '-l', $Location,
-    '--image', "$loginServer/$imageTag",
-    '--os-type', 'Linux',
-    '--cpu', $Cpu,
-    '--memory', $Memory,
-    '--restart-policy', 'Always',
-    '--ports', $StartTlsPort, $ImplicitTlsPort,
-    '--protocol', 'TCP',
-    '--azure-file-volume-account-name', $storageName,
-    '--azure-file-volume-account-key', $storageKey,
-    '--azure-file-volume-share-name', $shareName,
-    '--azure-file-volume-mount-path', '/mail',
-    '--environment-variables',
-        # Each value is wrapped in literal double quotes. On Windows `az` is az.cmd, so every
-        # argument goes through cmd.exe first, and the parentheses in two @Microsoft.KeyVault(...)
-        # references read as unbalanced grouping -- cmd fails with "MailSink__Password was
-        # unexpected at this time" before az is ever invoked. Quoting keeps each value one token.
-        (Quote 'MailSink__MailDirectory=/mail'),
-        # The image already listens on these two, but naming them here keeps the published ports
-        # and the listener from drifting apart when either is changed.
-        (Quote "MailSink__StartTlsPorts__0=$StartTlsPort"),
-        (Quote "MailSink__ImplicitTlsPorts__0=$ImplicitTlsPort"),
-        (Quote "TZ=$TimeZone"),
-        (Quote "MailSink__Username=$usernameReference"),
-        (Quote "MailSink__Password=$passwordReference"),
-        # Not a secret: the certificate's private key is fetched through the managed identity.
-        (Quote "MailSink__Tls__KeyVaultCertificateUri=$certificateUri"),
-        # Naming the one vault the sink may read means a reference pointing anywhere else is
-        # refused rather than fetched.
-        (Quote "MailSink__KeyVault__AllowedHosts__0=$vaultHost"),
-        # A container group can carry several identities; the default credential cannot guess.
-        (Quote "MailSink__KeyVault__ManagedIdentityClientId=$identityClientId")
-)
+$environment = [ordered]@{
+    'MailSink__MailDirectory'                     = '/mail'
+    # The image already listens on these, but naming them keeps the published ports and the
+    # listener from drifting apart when either is changed.
+    'MailSink__StartTlsPorts__0'                  = "$StartTlsPort"
+    'MailSink__ImplicitTlsPorts__0'               = "$ImplicitTlsPort"
+    # Not published, so it is reachable by the probe and not by a sender.
+    'MailSink__HealthPort'                        = "$HealthPort"
+    'TZ'                                          = $TimeZone
+    'MailSink__Username'                          = $usernameReference
+    'MailSink__Password'                          = $passwordReference
+    # Not a secret: the certificate's private key is fetched through the managed identity.
+    'MailSink__Tls__KeyVaultCertificateUri'       = $certificateUri
+    # Naming the one vault the sink may read means a reference pointing anywhere else is refused
+    # rather than fetched.
+    'MailSink__KeyVault__AllowedHosts__0'         = $vaultHost
+    # A container group can carry several identities; the default credential cannot guess.
+    'MailSink__KeyVault__ManagedIdentityClientId' = $identityClientId
+}
 
 if ($UseAdminCredentials) {
     Step 'Registry admin credentials'
     $registryUser = Invoke-Az @('acr', 'credential', 'show', '-n', $registryName, '--query', 'username', '-o', 'tsv')
     $registryPassword = Invoke-Az @('acr', 'credential', 'show', '-n', $registryName, '--query', 'passwords[0].value', '-o', 'tsv')
-    $containerArgs += @('--registry-login-server', $loginServer,
-        '--registry-username', $registryUser,
-        '--registry-password', $registryPassword)
+    $registryCredentials = @(
+        [ordered]@{ server = $loginServer; username = $registryUser; password = $registryPassword }
+    )
 
     # Nothing new to propagate on this path; the vault grants were made further up.
     $newRoleAssignment = $false
@@ -699,20 +675,113 @@ else {
     # Only a brand new assignment needs to propagate before the pull can use it. The wait is
     # skipped entirely on every later run, which is where the minute used to be spent.
     $newRoleAssignment = Grant-Role -PrincipalId $principalId -Role 'AcrPull' -Scope $registryId
-    $containerArgs += @('--acr-identity', $identityId)
+    $registryCredentials = @(
+        [ordered]@{ server = $loginServer; identity = $identityId }
+    )
 }
 
-# Attached either way: the sink needs the identity to read its credentials from the vault,
-# whether or not it is also the thing pulling the image.
-$containerArgs += @('--assign-identity', $identityId)
+$ports = @(
+    [ordered]@{ protocol = 'TCP'; port = $StartTlsPort },
+    [ordered]@{ protocol = 'TCP'; port = $ImplicitTlsPort }
+)
+
+# The container group is deployed from a file rather than from switches, because a liveness probe
+# can only be expressed that way -- ACI has no CLI flag for one, and without a probe nothing can
+# tell a wedged container from a healthy one. It also keeps the storage account key and the
+# registry password off the command line, which the switch form could not do: they now travel in
+# a temp file that is deleted straight after.
+$group = [ordered]@{
+    apiVersion = '2021-10-01'
+    location   = $Location
+    name       = $containerGroup
+    type       = 'Microsoft.ContainerInstance/containerGroups'
+    identity   = [ordered]@{
+        type                   = 'UserAssigned'
+        # Attached whether or not it is also pulling the image: the sink needs it to read the
+        # credentials and the certificate out of the vault.
+        userAssignedIdentities = @{ $identityId = @{} }
+    }
+    properties = [ordered]@{
+        osType                   = 'Linux'
+        restartPolicy            = 'Always'
+        imageRegistryCredentials = $registryCredentials
+        containers               = @(
+            [ordered]@{
+                name       = 'mail-sink'
+                properties = [ordered]@{
+                    image                = "$loginServer/$imageTag"
+                    resources            = @{ requests = [ordered]@{ cpu = [double]$Cpu; memoryInGB = [double]$Memory } }
+                    ports                = $ports
+                    environmentVariables = @(
+                        $environment.Keys | ForEach-Object { [ordered]@{ name = $_; value = $environment[$_] } }
+                    )
+                    volumeMounts         = @([ordered]@{ name = 'mail'; mountPath = '/mail' })
+                    livenessProbe        = [ordered]@{
+                        httpGet             = [ordered]@{ path = '/healthz'; port = $HealthPort; scheme = 'http' }
+                        # The sink has to reach Key Vault for its certificate before it answers,
+                        # and on a cold start the role assignment may still be propagating, so the
+                        # first check waits rather than restarting a container that is fine.
+                        initialDelaySeconds = 30
+                        periodSeconds       = 30
+                        timeoutSeconds      = 5
+                        failureThreshold    = 3
+                    }
+                }
+            }
+        )
+        volumes                  = @(
+            [ordered]@{
+                name      = 'mail'
+                azureFile = [ordered]@{
+                    shareName          = $shareName
+                    storageAccountName = $storageName
+                    storageAccountKey  = $storageKey
+                }
+            }
+        )
+    }
+}
 
 if ($Exposure -eq 'Public') {
-    $containerArgs += @('--ip-address', 'Public', '--dns-name-label', $DnsLabel)
+    $group.properties.ipAddress = [ordered]@{
+        type         = 'Public'
+        dnsNameLabel = $DnsLabel
+        ports        = $ports
+    }
 }
 else {
-    # az creates the VNet and the ACI-delegated subnet if they are absent.
-    $containerArgs += @('--vnet', $VNetName, '--vnet-address-prefix', $VNetAddressPrefix,
-        '--subnet', $SubnetName, '--subnet-address-prefix', $SubnetAddressPrefix)
+    Step "Virtual network ($VNetName/$SubnetName)"
+
+    # az container create --vnet would create these on the fly, but the file form takes a subnet
+    # id and cannot, so they are created here. Both checks are idempotent.
+    $vnetId = & az network vnet show -g $ResourceGroup -n $VNetName --query id -o tsv 2>$null
+    $global:LASTEXITCODE = 0
+
+    if (-not $vnetId) {
+        Invoke-Az @('network', 'vnet', 'create', '-g', $ResourceGroup, '-n', $VNetName,
+            '-l', $Location, '--address-prefix', $VNetAddressPrefix, '-o', 'none') | Out-Null
+        Write-Host "    created $VNetName ($VNetAddressPrefix)"
+    }
+    else {
+        Write-Host "    $VNetName already exists"
+    }
+
+    $subnetId = & az network vnet subnet show -g $ResourceGroup --vnet-name $VNetName -n $SubnetName --query id -o tsv 2>$null
+    $global:LASTEXITCODE = 0
+
+    if (-not $subnetId) {
+        # The delegation is what makes a subnet usable by a container group at all.
+        $subnetId = Invoke-Az @('network', 'vnet', 'subnet', 'create', '-g', $ResourceGroup,
+            '--vnet-name', $VNetName, '-n', $SubnetName, '--address-prefixes', $SubnetAddressPrefix,
+            '--delegations', 'Microsoft.ContainerInstance/containerGroups', '--query', 'id', '-o', 'tsv')
+        Write-Host "    created $SubnetName ($SubnetAddressPrefix), delegated to ACI"
+    }
+    else {
+        Write-Host "    $SubnetName already exists"
+    }
+
+    $group.properties.ipAddress = [ordered]@{ type = 'Private'; ports = $ports }
+    $group.properties.subnetIds = @([ordered]@{ id = $subnetId })
 }
 
 Step "Container group ($containerGroup)"
@@ -725,17 +794,9 @@ try {
         cpu         = [double]$Cpu
         memory      = [double]$Memory
         ports       = @([int]$StartTlsPort, [int]$ImplicitTlsPort)
-        env         = @{
-            'MailSink__MailDirectory'                     = '/mail'
-            'MailSink__StartTlsPorts__0'                  = "$StartTlsPort"
-            'MailSink__ImplicitTlsPorts__0'               = "$ImplicitTlsPort"
-            'TZ'                                          = $TimeZone
-            'MailSink__Username'                          = $usernameReference
-            'MailSink__Password'                          = $passwordReference
-            'MailSink__Tls__KeyVaultCertificateUri'       = $certificateUri
-            'MailSink__KeyVault__AllowedHosts__0'         = $vaultHost
-            'MailSink__KeyVault__ManagedIdentityClientId' = $identityClientId
-        }
+        # The one built above, so the two can no longer drift apart. Keeping a second copy here
+        # is what used to make an unchanged deployment recreate itself on every run.
+        env         = $environment
     }
 
     $current = $null
@@ -772,24 +833,37 @@ try {
         # fails -- usually the first attempt succeeds and nothing is waited for at all.
         $attempts = if ($newRoleAssignment) { 6 } else { 1 }
 
-        for ($attempt = 1; ; $attempt++) {
-            try {
-                Invoke-Az $containerArgs | Out-Null
-                break
-            }
-            catch {
-                if ($attempt -ge $attempts) { throw }
+        # JSON, which az parses with a YAML loader that accepts it. Building the document as a
+        # PowerShell object and converting is far harder to get subtly wrong than emitting YAML
+        # by hand, and the quoting rules stop mattering entirely.
+        $groupFile = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName() + '.json')
 
-                Write-Host "    attempt $attempt failed (likely the role assignment propagating); retrying in 15s"
-                Start-Sleep -Seconds 15
+        try {
+            [IO.File]::WriteAllText($groupFile, ($group | ConvertTo-Json -Depth 12))
+
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    Invoke-Az @('container', 'create', '-g', $ResourceGroup, '--file', $groupFile, '-o', 'none') | Out-Null
+                    break
+                }
+                catch {
+                    if ($attempt -ge $attempts) { throw }
+
+                    Write-Host "    attempt $attempt failed (likely the role assignment propagating); retrying in 15s"
+                    Start-Sleep -Seconds 15
+                }
             }
+        }
+        finally {
+            # The file carries the storage account key, so it does not outlive the call.
+            Remove-Item $groupFile -Force -ErrorAction SilentlyContinue
         }
     }
 }
 finally {
     # Drop the references once the key has served its purpose. This is tidiness, not erasure --
     # .NET strings are immutable, so the bytes stay in memory until the process ends.
-    $containerArgs = $null
+    $group = $null
     $storageKey = $null
     $registryPassword = $null
 }
@@ -839,6 +913,7 @@ Write-Host "  SMTP port : $StartTlsPort (STARTTLS), $ImplicitTlsPort (implicit T
 Write-Host "  SMTP user : $SmtpUsername"
 Write-Host '  Auth      : required, over TLS only'
 Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
+Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
 Write-Host "  Mail share: $storageName/$shareName"
 Write-Host ''
 Write-Host 'The password is in the key vault; the container reads it through its managed identity.'

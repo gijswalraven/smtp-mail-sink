@@ -11,6 +11,7 @@ namespace MailSink;
 public sealed class SmtpListenerService(
     IOptions<MailSinkOptions> options,
     IMailWriter writer,
+    SinkHealth health,
     IHostEnvironment environment,
     IServiceProvider serviceProvider,
     ILogger<SmtpListenerService> logger) : BackgroundService
@@ -71,11 +72,18 @@ public sealed class SmtpListenerService(
 
         try
         {
+            health.MarkListening();
             await _server.StartAsync(stoppingToken);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             // Normal shutdown.
+        }
+        finally
+        {
+            // Whatever ended the loop -- shutdown, a fault, a bind failure -- the sink is no
+            // longer taking mail, and the health endpoint has to start saying so.
+            health.MarkStopped();
         }
     }
 

@@ -82,6 +82,14 @@ public sealed class MailSinkOptions
     /// <summary>How long the server waits for the next command before giving up on a session.</summary>
     public TimeSpan CommandWaitTimeout { get; set; } = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// Port for the HTTP health endpoint an orchestrator probes; 0 disables it. Separate from the
+    /// SMTP ports and never published, so it is reachable from the host running the probe and not
+    /// from a sender. In Development a port already in use is a warning; anywhere else it stops
+    /// the host, because a deployment whose probe never answers is restarted forever.
+    /// </summary>
+    public int HealthPort { get; set; } = 8080;
+
     /// <summary>Put each day's mail in its own yyyy-MM-dd subfolder.</summary>
     public bool GroupByDate { get; set; } = true;
 

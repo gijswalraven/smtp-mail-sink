@@ -112,6 +112,7 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `MaxAuthenticationAttempts`  | `3`         | Failed AUTHs before the session is dropped.                     |
 | `SessionTimeout`             | `00:02:00`  | How long one session may stay open.                             |
 | `CommandWaitTimeout`         | `00:01:00`  | How long to wait for the next command.                          |
+| `HealthPort`                 | `8080`      | HTTP health endpoint; `0` disables it.                          |
 | `GroupByDate`                | `true`      | Write into a `yyyy-MM-dd` subfolder per day.                    |
 
 The three port lists are the one place the defaults do not live in `appsettings.json`: the
@@ -200,6 +201,20 @@ than fetched.
 
 Resolution only runs when a value actually starts with `@Microsoft.KeyVault(`, so a local run
 never builds a credential chain or looks for a managed identity that isn't there.
+
+## Health
+
+The sink answers `GET /healthz` on `MailSink:HealthPort` (8080 by default) with `200 ok` while it
+is listening and `503` once it is not. The port is never published alongside the SMTP ports, so an
+orchestrator on the host can reach it and a sender cannot.
+
+[deploy.ps1](deploy/deploy.ps1) wires it to an ACI liveness probe, which is the whole reason it
+exists: Azure Container Instances supports only `exec` and `httpGet` probes — there is no TCP
+probe — so without it nothing could tell a wedged container from a healthy one.
+
+Set `HealthPort` to `0` to switch it off. If the port is already taken, a `Development` run logs a
+warning and carries on; anywhere else the host stops, because a deployment whose probe never
+answers would be restarted forever.
 
 ## Docker
 

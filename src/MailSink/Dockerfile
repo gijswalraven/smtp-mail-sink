@@ -24,6 +24,10 @@ EXPOSE 2587 2465
 # The plain-text port, opened only in the Development environment.
 EXPOSE 1025
 
+# The health endpoint an orchestrator probes. Deliberately not published alongside the SMTP
+# ports: the probe runs against the container, senders never reach it.
+EXPOSE 8080
+
 # The listener takes input from the network and parses hostile MIME, so it does not run as root.
 # APP_UID is defined by the base image (1654); /mail must be writable by it.
 RUN mkdir -p /mail && chown $APP_UID:$APP_UID /mail /app

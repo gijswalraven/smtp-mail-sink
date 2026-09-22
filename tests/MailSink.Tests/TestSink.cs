@@ -71,6 +71,9 @@ internal sealed class TestSink : IAsyncDisposable
             ["MailSink:MailDirectory"] = mailDirectory,
             ["MailSink:ListenAddress"] = "127.0.0.1",
             [PortKey(transport)] = port.ToString(),
+            // Off unless a test asks for it: the default port would collide across the test
+            // classes xunit runs in parallel, and outside Development that is a hard failure.
+            ["MailSink:HealthPort"] = "0",
         };
 
         if (transport != SinkTransport.PlainText)
@@ -201,6 +204,9 @@ internal sealed class TestSink : IAsyncDisposable
 
         Assert.Empty(files);
     }
+
+    /// <summary>A port nothing is listening on, for a caller that needs to configure one.</summary>
+    public static int FreePort() => FreeTcpPort();
 
     private static int FreeTcpPort()
     {

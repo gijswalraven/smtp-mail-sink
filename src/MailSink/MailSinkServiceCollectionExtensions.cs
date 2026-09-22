@@ -28,6 +28,7 @@ public static class MailSinkServiceCollectionExtensions
         services.Configure<KeyVaultOptions>(configuration.GetSection(KeyVaultOptions.SectionName));
 
         services.AddSingleton(TimeProvider.System);
+        services.AddSingleton<SinkHealth>();
         services.AddSingleton<IMailWriter, FileMailWriter>();
         services.AddSingleton<IMessageMetadataReader, MimeMessageMetadataReader>();
         services.AddSingleton<IMailCapture, MailCapture>();
@@ -56,6 +57,7 @@ public static class MailSinkServiceCollectionExtensions
         }
 
         services.AddHostedService<SmtpListenerService>();
+        services.AddHostedService<HealthEndpointService>();
 
         return services;
     }
