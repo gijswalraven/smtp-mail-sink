@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SmtpServer;
@@ -52,8 +53,13 @@ public sealed class SmtpListenerService(
         _server.SessionCancelled += OnSessionEnded;
         _server.SessionFaulted += (_, e) =>
         {
+            var client = SessionClient.Address(e.Context)?.ToString() ?? "an unknown address";
             OnSessionEnded(null, e);
-            logger.LogWarning(e.Exception, "SMTP session faulted");
+            logger.LogWarning(
+                e.Exception,
+                "SMTP session {SessionId} from {Client} faulted",
+                e.Context.SessionId,
+                client);
         };
 
         logger.LogInformation(
@@ -129,7 +135,12 @@ public sealed class SmtpListenerService(
         }
 
         var mode = options.TlsMode == SmtpTlsMode.Implicit ? "implicit TLS" : "STARTTLS";
-        var floor = options.Tls.MinimumProtocol == TlsProtocolFloor.Tls13 ? "TLS 1.3" : "TLS 1.2+";
+        var floor = options.Tls.Protocols switch
+        {
+            SslProtocols.Tls13 => "TLS 1.3 only",
+            SslProtocols.Tls12 => "TLS 1.2 only",
+            _ => "TLS 1.2+",
+        };
         return $"{mode} on port {port} ({floor})";
     }
 
@@ -165,6 +176,14 @@ public sealed class SmtpListenerService(
     {
         var address = SessionClient.Address(e.Context);
         _sessions[e.Context] = address;
+
+        // Before TLS, before the greeting. A client that fails in the handshake and a client that
+        // never reached the sink at all look identical without this line, and telling those two
+        // apart is most of diagnosing a sender that "just fails".
+        logger.LogInformation(
+            "session {SessionId} accepted from {Client}",
+            e.Context.SessionId,
+            address?.ToString() ?? "an unknown address");
 
         if (!ExceedsLimit(address, out var reason))
         {

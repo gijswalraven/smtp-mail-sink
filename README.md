@@ -121,7 +121,8 @@ Set in `src/MailSink/appsettings.json`, or override with environment variables u
 | `Accounts:<name>:Password`     | *(none)*     | Password for that account. Required.                                                        |
 | `Accounts:<name>:Folder`       | *(the name)* | Folder — or blob container — its mail goes to.                                              |
 | `Tls:KeyVaultCertificateUri`   | *(empty)*    | Key Vault certificate URI. Required outside `Development`.                                  |
-| `Tls:MinimumProtocol`          | `Tls12`      | `Tls12` (1.2 and 1.3) or `Tls13` (1.3 only).                                                |
+| `Tls:MinimumProtocol`          | `Tls12`      | Lowest version offered: `Tls12` or `Tls13`.                                                 |
+| `Tls:MaximumProtocol`          | `Tls13`      | Highest version offered. `Tls12` stops 1.3 being offered — a diagnostic lever, not hardening. |
 | `Tls:RefreshInterval`          | `01:00:00`   | How often a rotated certificate is re-read.                                                 |
 | `Blob:ServiceUri`              | *(empty)*    | Write to this Azure storage account instead of the filesystem.                              |
 | `Blob:Container`               | `mail`       | Container for mail that belongs to no account.                                              |
@@ -222,7 +223,10 @@ as disclosed.
 the first `EHLO` and appears in the second, after the upgrade. Together with that `530`, this
 means a session which skips STARTTLS has no route to a delivered message, and credentials cannot
 cross the wire in the clear even from a client that would have been willing to send them. Nothing
-below TLS 1.2 is offered, and `Tls:MinimumProtocol: Tls13` narrows it further.
+below TLS 1.2 is offered, and `Tls:MinimumProtocol: Tls13` narrows it further. `Tls:MaximumProtocol:
+Tls12` narrows it from the other end, which is worth reaching for only when a client cannot complete
+a TLS 1.3 handshake — that failure looks like a network fault from this side, so ruling it out means
+taking 1.3 away and seeing whether the client recovers.
 
 Three failed AUTHs drop the session (`MaxAuthenticationAttempts`), and each one is logged at
 warning with the username and the client address, so a run of them is something a SIEM can alert

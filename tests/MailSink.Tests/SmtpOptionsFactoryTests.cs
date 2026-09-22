@@ -149,11 +149,17 @@ public class SmtpOptionsFactoryTests
     }
 
     [Theory]
-    [InlineData(TlsProtocolFloor.Tls12, SslProtocols.Tls12 | SslProtocols.Tls13)]
-    [InlineData(TlsProtocolFloor.Tls13, SslProtocols.Tls13)]
-    public void Build_pins_the_protocol_floor(TlsProtocolFloor floor, SslProtocols expected)
+    [InlineData(TlsProtocolVersion.Tls12, TlsProtocolVersion.Tls13, SslProtocols.Tls12 | SslProtocols.Tls13)]
+    [InlineData(TlsProtocolVersion.Tls13, TlsProtocolVersion.Tls13, SslProtocols.Tls13)]
+    [InlineData(TlsProtocolVersion.Tls12, TlsProtocolVersion.Tls12, SslProtocols.Tls12)]
+    public void Build_pins_the_protocol_range(
+        TlsProtocolVersion floor, TlsProtocolVersion ceiling, SslProtocols expected)
     {
-        var options = Deployed(o => o.Tls.MinimumProtocol = floor);
+        var options = Deployed(o =>
+        {
+            o.Tls.MinimumProtocol = floor;
+            o.Tls.MaximumProtocol = ceiling;
+        });
 
         var built = SmtpOptionsFactory.Build(options, isDevelopment: false, new FakeCertificateFactory());
 
@@ -223,6 +229,31 @@ public class SmtpOptionsFactoryTests
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
 
         Assert.Contains("MailSink:Accounts, or the MailSink:Username and MailSink:Password pair, is", ex.Message);
+    }
+
+
+    [Fact]
+    public void Validate_refuses_a_protocol_range_that_offers_nothing()
+    {
+        var options = Deployed(o =>
+        {
+            o.Tls.MinimumProtocol = TlsProtocolVersion.Tls13;
+            o.Tls.MaximumProtocol = TlsProtocolVersion.Tls12;
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
+
+        Assert.Contains("leaves no version to negotiate", ex.Message);
+    }
+
+    [Fact]
+    public void MaximumProtocol_Tls12_takes_1_3_off_the_table()
+    {
+        // The diagnostic case: a client whose TLS stack cannot complete a 1.3 handshake.
+        var options = Deployed(o => o.Tls.MaximumProtocol = TlsProtocolVersion.Tls12);
+
+        Assert.Equal(SslProtocols.Tls12, options.Tls.Protocols);
+        Assert.False(options.Tls.Protocols.HasFlag(SslProtocols.Tls13));
     }
 
     [Fact]

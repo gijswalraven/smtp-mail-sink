@@ -153,6 +153,12 @@ param(
     [ValidateSet('StartTls', 'Implicit', 'None')]
     [string]$TlsMode = 'StartTls',
 
+    # Highest TLS version offered. Tls13 by default. Set Tls12 to stop offering 1.3, which is a
+    # diagnostic lever for a client whose TLS stack aborts a 1.3 handshake -- that shows up here
+    # as a session faulting mid-handshake and says nothing about which end is at fault.
+    [ValidateSet('Tls12', 'Tls13')]
+    [string]$MaxTlsVersion = 'Tls13',
+
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,
 
@@ -943,10 +949,16 @@ $environment = [ordered]@{
     # listener from drifting apart when either is changed.
     'MailSink__Port'                              = "$Port"
     'MailSink__TlsMode'                           = $TlsMode
+    'MailSink__Tls__MaximumProtocol'              = $MaxTlsVersion
     # Not published, so it is reachable by the probe and not by a sender.
     'MailSink__HealthPort'                        = "$HealthPort"
     # The sink sweeps the blob container itself; 0 means it deletes nothing.
     'MailSink__Retention__MaxAge'                 = ([timespan]::FromHours($RetentionHours)).ToString()
+    # Timestamps on every log line. Without them a container log cannot be lined up against
+    # "I pressed the button at 16:42", which is the only way to tell one sender's failed attempt
+    # from the scanner traffic a public endpoint collects all day.
+    'Logging__Console__TimestampFormat'           = '[yyyy-MM-dd HH:mm:ss] '
+    'Logging__Console__UseUtcTimestamp'           = 'true'
     'TZ'                                          = $TimeZone
     # Not a secret: the certificate's private key is fetched through the managed identity.
     'MailSink__Tls__KeyVaultCertificateUri'       = $certificateUri
@@ -1257,7 +1269,8 @@ if ($TlsMode -eq 'None') {
     Write-Host "  Cert      : not presented -- TLS is off (it stays in the vault for the way back)"
 }
 else {
-    Write-Host "  Cert for  : $CertificateSubject (self-signed, TLS 1.2+)"
+    $protocolSummary = $MaxTlsVersion -eq 'Tls12' ? 'TLS 1.2 only' : 'TLS 1.2+'
+    Write-Host "  Cert for  : $CertificateSubject (self-signed, $protocolSummary)"
 }
 Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
 Write-Host "  Mail store: $blobEndpoint, one container per account: $($containers -join ', ')"

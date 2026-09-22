@@ -2,8 +2,8 @@ using System.Security.Authentication;
 
 namespace MailSink;
 
-/// <summary>The lowest TLS version a client may negotiate.</summary>
-public enum TlsProtocolFloor
+/// <summary>A TLS version, used as both the floor and the ceiling of what is offered.</summary>
+public enum TlsProtocolVersion
 {
     /// <summary>TLS 1.2 and 1.3. The default: 1.3 alone still turns away real clients.</summary>
     Tls12,
@@ -46,7 +46,19 @@ public sealed class TlsOptions
     public string KeyVaultCertificateUri { get; set; } = string.Empty;
 
     /// <summary>Lowest TLS version a client may negotiate. Nothing below 1.2 is offered.</summary>
-    public TlsProtocolFloor MinimumProtocol { get; set; } = TlsProtocolFloor.Tls12;
+    public TlsProtocolVersion MinimumProtocol { get; set; } = TlsProtocolVersion.Tls12;
+
+    /// <summary>
+    /// Highest TLS version a client may negotiate. 1.3 by default, so the newest both ends
+    /// support is used.
+    /// </summary>
+    /// <remarks>
+    /// Set to Tls12 to take 1.3 off the table. That is a diagnostic lever rather than a hardening
+    /// one -- 1.3 is the better protocol -- but some client TLS stacks abort a 1.3 handshake in
+    /// ways that look like a network fault from the server side, and the only cheap way to rule
+    /// that out is to stop offering it.
+    /// </remarks>
+    public TlsProtocolVersion MaximumProtocol { get; set; } = TlsProtocolVersion.Tls13;
 
     /// <summary>
     /// How long a fetched certificate is reused before Key Vault is asked again. This is what
@@ -63,7 +75,14 @@ public sealed class TlsOptions
     /// straight onto <see cref="SslProtocols"/>: that would let configuration switch TLS 1.0 back
     /// on, and there is no reason to allow it.
     /// </summary>
-    public SslProtocols Protocols => MinimumProtocol == TlsProtocolFloor.Tls13
-        ? SslProtocols.Tls13
-        : SslProtocols.Tls12 | SslProtocols.Tls13;
+    public SslProtocols Protocols => (MinimumProtocol, MaximumProtocol) switch
+    {
+        (TlsProtocolVersion.Tls13, _) => SslProtocols.Tls13,
+        (_, TlsProtocolVersion.Tls12) => SslProtocols.Tls12,
+        _ => SslProtocols.Tls12 | SslProtocols.Tls13,
+    };
+
+    /// <summary>True when the range is the wrong way round and would offer nothing.</summary>
+    public bool IsProtocolRangeInverted =>
+        MinimumProtocol == TlsProtocolVersion.Tls13 && MaximumProtocol == TlsProtocolVersion.Tls12;
 }

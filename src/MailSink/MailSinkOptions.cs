@@ -220,6 +220,13 @@ public sealed class MailSinkOptions
         // reason. It is not silent -- the listener warns on every start, and the deploy script
         // warns again -- and it still requires credentials, because dropping two controls at once
         // on the strength of one diagnostic is not a trade worth offering.
+        if (Tls.IsProtocolRangeInverted)
+        {
+            throw new InvalidOperationException(
+                $"{SectionName}:Tls:MinimumProtocol is Tls13 and MaximumProtocol is Tls12, which " +
+                "leaves no version to negotiate and would refuse every client.");
+        }
+
         if (TlsMode != SmtpTlsMode.None && !Tls.IsConfigured)
         {
             throw new InvalidOperationException(
