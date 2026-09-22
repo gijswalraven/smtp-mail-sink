@@ -91,11 +91,13 @@ param(
     # Public only. Must be globally unique within the region.
     [string]$DnsLabel,
 
-    # The standard submission ports. Privileged, but a container runtime sets
-    # net.ipv4.ip_unprivileged_port_start=0, so the non-root user in the image binds them fine.
-    # Move them high if a runtime ever refuses.
-    [int]$StartTlsPort = 587,
-    [int]$ImplicitTlsPort = 465,
+    # Not 587 and 465, because Azure Container Instances does not set
+    # net.ipv4.ip_unprivileged_port_start=0 the way Docker does, and the image runs as a non-root
+    # user: binding a privileged port there fails with EACCES and the container restarts forever.
+    # Verified against ACI. Senders therefore need the port in their configuration; put a load
+    # balancer in front if they cannot.
+    [int]$StartTlsPort = 2587,
+    [int]$ImplicitTlsPort = 2465,
 
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,

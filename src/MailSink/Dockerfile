@@ -13,10 +13,10 @@ COPY --from=build /app .
 ENV MailSink__MailDirectory=/mail
 VOLUME /mail
 
-# The standard submission ports. Both are privileged and this image runs as a non-root user, but
-# container runtimes set net.ipv4.ip_unprivileged_port_start=0, so binding them needs no extra
-# capability -- verified against this image. A runtime that does not do that will fail to bind;
-# point MailSink__StartTlsPorts__0 and MailSink__ImplicitTlsPorts__0 at high ports if so.
+# The standard submission ports, which the sink defaults to. Both are privileged and this image
+# runs as a non-root user; whether that works depends on the runtime. Docker sets
+# net.ipv4.ip_unprivileged_port_start=0 so it binds them fine, but Azure Container Instances does
+# not, and there the bind fails with EACCES -- so deploy.ps1 moves them above 1024. Both verified.
 EXPOSE 587 465
 
 # The plain-text port, opened only in the Development environment.

@@ -284,6 +284,13 @@ is self-signed, senders have to be told to trust it — the script prints the
 `az keyvault certificate download` command for that. Replace the certificate in the vault with one
 from your own CA and the sink picks the replacement up on its next refresh.
 
+**Ports.** `-StartTlsPort` defaults to `2587` and `-ImplicitTlsPort` to `2465`, not the standard
+`587` and `465`. The image runs as a non-root user, and whether such a user may bind a privileged
+port depends on the runtime: Docker sets `net.ipv4.ip_unprivileged_port_start=0` and allows it,
+Azure Container Instances does not. Both were tested — on ACI the standard ports fail with
+`SocketException (13): Permission denied` and the container restarts forever. Senders therefore
+need the port in their configuration; put a load balancer in front if they cannot.
+
 **Exposure.** The default is `-Exposure Private`: the container group sits in a VNet with no public
 IP, reachable from that VNet, peered networks, or over VPN. `-Exposure Public -DnsLabel <label>`
 gives it an `<label>.<region>.azurecontainer.io` FQDN instead. Every session has to authenticate

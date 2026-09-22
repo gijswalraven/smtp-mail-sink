@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SmtpServer;
@@ -78,6 +79,20 @@ public sealed class SmtpListenerService(
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
             // Normal shutdown.
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AccessDenied)
+        {
+            // Bare "Permission denied" from deep inside the library says nothing about which port
+            // or why. Ports below 1024 are privileged, and whether a non-root container may bind
+            // one depends on the runtime: Docker allows it, Azure Container Instances does not.
+            // Diagnosing that from the raw exception cost an afternoon; say it plainly instead.
+            throw new InvalidOperationException(
+                $"Could not bind {DescribeTransport(_options, isDevelopment)} as this user. Ports " +
+                "below 1024 are privileged, and not every container runtime lets a non-root " +
+                "process bind one -- Azure Container Instances does not. Move the listener above " +
+                "1024 with MailSink:StartTlsPorts and MailSink:ImplicitTlsPorts, and publish or " +
+                "forward the port senders should see.",
+                ex);
         }
         finally
         {
