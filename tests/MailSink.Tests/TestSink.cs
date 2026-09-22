@@ -14,53 +14,29 @@ using SmtpClient = MailKit.Net.Smtp.SmtpClient;
 
 namespace MailSink.Tests;
 
-/// <summary>How a <see cref="TestSink"/> listens, and so how a client must connect to it.</summary>
-public enum SinkTransport
-{
-    /// <summary>Plain text, the Development-only mode. Credentials are optional here.</summary>
-    PlainText,
-
-    /// <summary>Port 587 style: plain connect, STARTTLS before AUTH.</summary>
-    StartTls,
-
-    /// <summary>Port 465 style: TLS from the first byte.</summary>
-    ImplicitTls,
-}
-
 /// <summary>
 /// A real sink on a free port writing to a temp folder, so the SmtpServer wiring, capture
-/// pipeline and file writer are all exercised. Shared by the end-to-end test classes, which differ
-/// only in the transport and settings they pass.
+/// pipeline and file writer are all exercised. Shared by the end-to-end test classes, which
+/// differ only in the settings they pass.
 /// </summary>
 internal sealed class TestSink : IAsyncDisposable
 {
-    /// <summary>
-    /// A URI that only has to parse and pass the allow-list: the factory that would fetch it is
-    /// replaced below, because a test cannot reach Key Vault. Its presence is what tells
-    /// <see cref="MailSinkOptions.Validate"/> that TLS is configured.
-    /// </summary>
-    private const string CertificateUri =
-        "https://kv-mailsink-test.vault.azure.net/certificates/mailsink-smtp";
-
     private readonly IHost _host;
 
-    private TestSink(IHost host, int port, string mailDirectory, SinkTransport transport)
+    private TestSink(IHost host, int port, string mailDirectory)
     {
         _host = host;
         Port = port;
         MailDirectory = mailDirectory;
-        Transport = transport;
     }
 
     public int Port { get; }
 
     public string MailDirectory { get; }
 
-    public SinkTransport Transport { get; }
-
     public static async Task<TestSink> StartAsync(
         IDictionary<string, string?>? settings = null,
-        SinkTransport transport = SinkTransport.PlainText)
+        bool production = false)
     {
         var mailDirectory = Path.Combine(
             Path.GetTempPath(), "mail-sink-tests", Guid.NewGuid().ToString("n"));
@@ -70,84 +46,40 @@ internal sealed class TestSink : IAsyncDisposable
         {
             ["MailSink:MailDirectory"] = mailDirectory,
             ["MailSink:ListenAddress"] = "127.0.0.1",
-            [PortKey] = port.ToString(),
-            ["MailSink:TlsMode"] = TlsModeFor(transport).ToString(),
+            ["MailSink:Port"] = port.ToString(),
             // Off unless a test asks for it: the default port would collide across the test
             // classes xunit runs in parallel, and outside Development that is a hard failure.
             ["MailSink:HealthPort"] = "0",
         };
-
-        if (transport != SinkTransport.PlainText)
-        {
-            configuration["MailSink:Tls:KeyVaultCertificateUri"] = CertificateUri;
-        }
 
         foreach (var (key, value) in settings ?? new Dictionary<string, string?>())
         {
             configuration[key] = value;
         }
 
-        // Plain text is only legal in Development; everything else runs as the deployed sink does,
-        // so the strict validation and the TLS wiring are what the tests actually exercise.
+        // Development relaxes the credential rule; a test that wants the deployed rules asks for
+        // Production and supplies its own.
         var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
         {
-            EnvironmentName = transport == SinkTransport.PlainText
-                ? Environments.Development
-                : Environments.Production,
+            EnvironmentName = production ? Environments.Production : Environments.Development,
         });
 
         builder.Configuration.AddInMemoryCollection(configuration);
         builder.Services.AddMailSink(builder.Configuration, builder.Environment);
 
-        if (transport != SinkTransport.PlainText)
-        {
-            // Swap the Key Vault factory for a local certificate. Everything downstream of it --
-            // endpoint wiring, protocol floor, STARTTLS negotiation -- is the production path.
-            builder.Services.RemoveAll<ICertificateFactory>();
-            builder.Services.AddSingleton<ICertificateFactory>(
-                new FakeCertificateFactory(TestCertificate.Shared));
-        }
-
         var host = builder.Build();
         await host.StartAsync();
         await WaitUntilListeningAsync(port);
 
-        return new TestSink(host, port, mailDirectory, transport);
+        return new TestSink(host, port, mailDirectory);
     }
 
-    /// <summary>One port for every transport now; the mode is what distinguishes them.</summary>
-    private const string PortKey = "MailSink:Port";
-
-    private static SmtpTlsMode TlsModeFor(SinkTransport transport) => transport switch
-    {
-        SinkTransport.PlainText => SmtpTlsMode.None,
-        SinkTransport.StartTls => SmtpTlsMode.StartTls,
-        SinkTransport.ImplicitTls => SmtpTlsMode.Implicit,
-        _ => throw new ArgumentOutOfRangeException(nameof(transport)),
-    };
-
-    private SecureSocketOptions SocketOptions => Transport switch
-    {
-        SinkTransport.PlainText => SecureSocketOptions.None,
-        SinkTransport.StartTls => SecureSocketOptions.StartTls,
-        SinkTransport.ImplicitTls => SecureSocketOptions.SslOnConnect,
-        _ => throw new ArgumentOutOfRangeException(nameof(Transport)),
-    };
-
-    /// <summary>
-    /// A client that trusts the test certificate. MailKit takes the callback per instance, unlike
-    /// ServicePointManager, which matters because xunit runs these classes in parallel.
-    /// </summary>
-    public SmtpClient CreateClient() => new()
-    {
-        ServerCertificateValidationCallback = (_, _, _, _) => true,
-        Timeout = 15000,
-    };
+    public SmtpClient CreateClient() => new() { Timeout = 15000 };
 
     public async Task SendAsync(MailMessage message, NetworkCredential? credentials = null)
     {
         using var client = CreateClient();
-        await client.ConnectAsync("127.0.0.1", Port, SocketOptions);
+        await client.ConnectAsync("127.0.0.1", Port, SecureSocketOptions.None);
 
         if (credentials is not null)
         {
@@ -158,11 +90,8 @@ internal sealed class TestSink : IAsyncDisposable
         await client.DisconnectAsync(quit: true);
     }
 
-    /// <summary>
-    /// What the server advertises in the very first EHLO, before any TLS upgrade. Used to prove
-    /// that AUTH is not on offer across an unencrypted connection.
-    /// </summary>
-    public async Task<SmtpCapabilities> CapabilitiesBeforeUpgradeAsync()
+    /// <summary>What the server advertises in EHLO.</summary>
+    public async Task<SmtpCapabilities> CapabilitiesAsync()
     {
         using var client = CreateClient();
         await client.ConnectAsync("127.0.0.1", Port, SecureSocketOptions.None);
@@ -234,9 +163,8 @@ internal sealed class TestSink : IAsyncDisposable
     }
 
     /// <summary>
-    /// StartAsync returns once the hosted service has been started, not once it is accepting, and
-    /// a TLS handshake widens that gap. Probing the socket keeps the first test connection from
-    /// racing the listener.
+    /// StartAsync returns once the hosted service has been started, not once it is accepting.
+    /// Probing the socket keeps the first test connection from racing the listener.
     /// </summary>
     private static async Task WaitUntilListeningAsync(int port)
     {

@@ -171,7 +171,7 @@ public class AccountOptionsTests
     public void Validate_accepts_accounts_as_the_deployed_credential_requirement()
     {
         var options = WithAccounts(("orders", Account()));
-        options.Tls.KeyVaultCertificateUri = "https://v.vault.azure.net/certificates/smtp";
+        options.ListenAddress = "127.0.0.1";
 
         options.Validate(isDevelopment: false);
     }

@@ -3,15 +3,15 @@ using MailSink;
 namespace MailSink.Tests;
 
 /// <summary>
-/// The Development convenience -- no TLS, often no credentials -- is the one configuration that
-/// must not end up reachable from the network by inheriting a default. These pin the rule that
+/// Nothing this sink serves is encrypted, so binding an address other machines can reach is the
+/// configuration that must never be arrived at by inheriting a default. These pin the rule that
 /// keeps it on loopback unless someone says otherwise in as many words.
 /// </summary>
 public class PlainTextReachTests
 {
     private static MailSinkOptions PlainText(Action<MailSinkOptions>? configure = null)
     {
-        var options = new MailSinkOptions { TlsMode = SmtpTlsMode.None };
+        var options = new MailSinkOptions();
         configure?.Invoke(options);
         return options;
     }
@@ -56,16 +56,15 @@ public class PlainTextReachTests
     }
 
     [Fact]
-    public void A_TLS_listener_may_bind_anything_without_the_opt_in()
+    public void The_waiver_lets_a_listener_bind_any_address()
     {
-        // The guard is about plain text, not about the address: a deployed container group binds
-        // 0.0.0.0 and is none of this rule's business.
+        // A deployed container group has to bind 0.0.0.0 to be reachable at all, so it says so.
         var options = new MailSinkOptions
         {
             Username = "app",
             Password = "s3cret",
             ListenAddress = "0.0.0.0",
-            Tls = { KeyVaultCertificateUri = "https://v.vault.azure.net/certificates/smtp" },
+            AllowPlainTextFromAnyAddress = true,
         };
 
         options.Validate(isDevelopment: false);
@@ -73,25 +72,12 @@ public class PlainTextReachTests
     }
 
     [Fact]
-    public void A_development_run_without_a_certificate_is_plain_text_whatever_the_mode_says()
+    public void A_listener_on_any_address_is_refused_without_the_waiver()
     {
-        // TlsMode defaults to StartTls, but with no certificate there is nothing to upgrade to,
-        // so the guard still applies -- otherwise the default mode would be a way around it.
         var options = new MailSinkOptions { ListenAddress = "0.0.0.0" };
 
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: true));
 
         Assert.Contains("AllowPlainTextFromAnyAddress", ex.Message);
-    }
-
-    [Fact]
-    public void The_message_size_ceiling_fits_a_modest_host()
-    {
-        // 10 MB across the default 64 concurrent sessions is 640 MB held in memory at worst,
-        // which fits the 1 GB container group the deploy script asks for.
-        var options = new MailSinkOptions();
-
-        Assert.Equal(10 * 1024 * 1024, options.MaxMessageSize);
-        Assert.True((long)options.MaxMessageSize * options.MaxConcurrentSessions < 1024L * 1024 * 1024);
     }
 }

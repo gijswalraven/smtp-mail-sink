@@ -15,7 +15,7 @@ public static class MailSinkServiceCollectionExtensions
     /// </summary>
     /// <param name="environment">
     /// Decides how strict the sink is. Development may run in plain text with no credentials;
-    /// every other environment must have both a certificate and a credential pair, and refuses
+    /// every other environment must have a credential pair, and refuses
     /// to start without them.
     /// </param>
     public static IServiceCollection AddMailSink(
@@ -61,11 +61,6 @@ public static class MailSinkServiceCollectionExtensions
         if (bound.HasCredentials)
         {
             services.AddSingleton<IUserAuthenticator, AccountUserAuthenticator>();
-        }
-
-        if (!SmtpOptionsFactory.IsPlainText(bound, isDevelopment))
-        {
-            services.AddSingleton<ICertificateFactory, KeyVaultCertificateFactory>();
         }
 
         services.AddHostedService<SmtpListenerService>();

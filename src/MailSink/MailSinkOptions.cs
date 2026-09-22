@@ -21,33 +21,16 @@ public sealed class MailSinkOptions
     public string ResolveMailDirectory(string contentRootPath) =>
         Path.GetFullPath(MailDirectory, contentRootPath);
 
-    /// <summary>Name the server reports in its SMTP greeting, and the name a certificate should cover.</summary>
+    /// <summary>Name the server reports in its SMTP greeting.</summary>
     public string ServerName { get; set; } = "mail-sink";
 
     /// <summary>
-    /// Port the sink listens on. One port, whose TLS behaviour is <see cref="TlsMode"/>.
+    /// Port the sink listens on. Zero, the default, means <see cref="DefaultPort"/>.
     /// </summary>
-    /// <remarks>
-    /// Zero, the default, means "the conventional port for the mode" -- resolved by
-    /// <see cref="SmtpOptionsFactory.ResolvePort"/> rather than here, so the default follows the
-    /// mode instead of having to be restated whenever the mode changes.
-    /// </remarks>
     public int Port { get; set; }
-
-    /// <summary>
-    /// Whether the port starts in plain text and upgrades with STARTTLS, is TLS from the first
-    /// byte, or is not encrypted at all. <see cref="SmtpTlsMode.None"/> is Development only.
-    /// </summary>
-    public SmtpTlsMode TlsMode { get; set; } = SmtpTlsMode.StartTls;
 
     /// <summary>1025 is the conventional sink port; 25 is privileged on Linux.</summary>
     public const int DefaultPort = 1025;
-
-    /// <summary>587, the submission port, is where STARTTLS belongs.</summary>
-    public const int DefaultStartTlsPort = 587;
-
-    /// <summary>465, the conventional implicit-TLS submission port.</summary>
-    public const int DefaultImplicitTlsPort = 465;
 
     /// <summary>
     /// Address to bind to. Loopback by default, so nothing is exposed to the network until it is
@@ -98,9 +81,6 @@ public sealed class MailSinkOptions
     /// appending to array defaults cannot apply.
     /// </remarks>
     public Dictionary<string, MailAccount> Accounts { get; set; } = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>TLS settings. Required outside Development.</summary>
-    public TlsOptions Tls { get; set; } = new();
 
     /// <summary>
     /// Azure Blob Storage destination. Naming a container sends captured mail there instead of to
@@ -163,13 +143,12 @@ public sealed class MailSinkOptions
 
     /// <summary>
     /// Rejects settings that cannot do what they say, rather than letting the sink start in a
-    /// state where a username is quietly unenforced or a production deployment silently listens
-    /// in plain text.
+    /// state where a username is quietly unenforced.
     /// </summary>
     /// <param name="isDevelopment">
     /// Whether the host is running in the Development environment. The relaxed rules exist so a
-    /// developer can still run <c>dotnet run</c> with no credentials and no certificate; every
-    /// other environment gets the strict set.
+    /// developer can still run <c>dotnet run</c> with no credentials at all; every other
+    /// environment gets the strict set.
     /// </param>
     public void Validate(bool isDevelopment)
     {
@@ -200,7 +179,7 @@ public sealed class MailSinkOptions
         ValidateAccounts();
         ValidateRetention();
         ValidateBlobContainers();
-        ValidatePlainTextReach(isDevelopment);
+        ValidatePlainTextReach();
 
         if (isDevelopment)
         {
@@ -214,48 +193,17 @@ public sealed class MailSinkOptions
                 "required outside the Development environment. The sink does not accept " +
                 "unauthenticated mail in a deployed environment; see SECURITY.md.");
         }
-
-        // TlsMode None is a deliberate opt-out, so it is allowed here rather than refused: it is
-        // the only way to tell a sender that fails against TLS from one that fails for some other
-        // reason. It is not silent -- the listener warns on every start, and the deploy script
-        // warns again -- and it still requires credentials, because dropping two controls at once
-        // on the strength of one diagnostic is not a trade worth offering.
-        if (Tls.IsProtocolRangeInverted)
-        {
-            throw new InvalidOperationException(
-                $"{SectionName}:Tls:MinimumProtocol is Tls13 and MaximumProtocol is Tls12, which " +
-                "leaves no version to negotiate and would refuse every client.");
-        }
-
-        if (TlsMode != SmtpTlsMode.None && !Tls.IsConfigured)
-        {
-            throw new InvalidOperationException(
-                "MailSink:Tls:KeyVaultCertificateUri is required outside the Development " +
-                "environment. The sink does not accept mail over an unencrypted connection in a " +
-                "deployed environment unless MailSink:TlsMode is set to None; see SECURITY.md.");
-        }
     }
 
 
-    /// <summary>True when the listener will not be encrypted.</summary>
-    /// <remarks>
-    /// Two ways to get here. <see cref="SmtpTlsMode.None"/> is deliberate and allowed anywhere,
-    /// including a deployed sink, so that a sender failing against TLS can be tested without it;
-    /// the listener logs a warning on every start in that case. The second is a Development run
-    /// with no certificate configured, which is the local convenience path.
-    /// </remarks>
-    public bool IsPlainText(bool isDevelopment) =>
-        TlsMode == SmtpTlsMode.None || (isDevelopment && !Tls.IsConfigured);
-
     /// <summary>
-    /// Keeps the Development convenience from reaching the network. Running without TLS and
-    /// often without credentials is what makes a local sink zero-configuration, and it is exactly
-    /// what must not be bound to an address other machines can reach -- so that combination has
-    /// to be asked for explicitly rather than arrived at by leaving a default in place.
+    /// Keeps an unencrypted listener off the network unless somebody says so. Every connection
+    /// to this sink is plain text, so binding an address other machines can reach has to be
+    /// asked for explicitly rather than arrived at by leaving a default in place.
     /// </summary>
-    private void ValidatePlainTextReach(bool isDevelopment)
+    private void ValidatePlainTextReach()
     {
-        if (!IsPlainText(isDevelopment) || AllowPlainTextFromAnyAddress)
+        if (AllowPlainTextFromAnyAddress)
         {
             return;
         }
@@ -264,7 +212,7 @@ public sealed class MailSinkOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:ListenAddress is {ListenAddress}, which other machines can reach, " +
-                "and this listener has no TLS. Bind 127.0.0.1, configure TLS, or set " +
+                "and this listener is never encrypted. Bind 127.0.0.1, or set " +
                 $"{SectionName}:AllowPlainTextFromAnyAddress to true if an unencrypted sink really " +
                 "should be reachable from the network -- inside a container, where the published " +
                 "port is what limits reach, that is what the compose file does.");
@@ -281,7 +229,7 @@ public sealed class MailSinkOptions
         {
             throw new InvalidOperationException(
                 $"{SectionName}:Port is {Port}, which is not a usable port. Use 1-65535, or 0 to " +
-                "take the conventional port for the configured TlsMode.");
+                "take the default port.");
         }
     }
 

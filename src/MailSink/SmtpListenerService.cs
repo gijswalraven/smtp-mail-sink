@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Security.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SmtpServer;
@@ -34,18 +33,9 @@ public sealed class SmtpListenerService(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var isDevelopment = environment.IsDevelopment();
-        var certificateFactory = serviceProvider.GetService<ICertificateFactory>();
-
-        // Pull the certificate down before the first client rather than during its handshake, so
-        // an unreachable vault or a certificate without a private key fails the host with a clear
-        // error instead of showing up as a TLS reset.
-        if (certificateFactory is KeyVaultCertificateFactory keyVaultCertificates)
-        {
-            keyVaultCertificates.Current();
-        }
 
         _server = new SmtpServerCore(
-            SmtpOptionsFactory.Build(_options, isDevelopment, certificateFactory),
+            SmtpOptionsFactory.Build(_options, isDevelopment),
             serviceProvider);
 
         _server.SessionCreated += OnSessionCreated;
@@ -65,34 +55,19 @@ public sealed class SmtpListenerService(
         logger.LogInformation(
             "mail sink listening on {Address}; {Transport}; auth: {Auth}; storing .eml in {Destination}",
             _options.ListenAddress,
-            DescribeTransport(_options, isDevelopment),
+            DescribeTransport(_options),
             DescribeAuthentication(_options),
             writer.Destination);
 
-        if (SmtpOptionsFactory.IsPlainText(_options, isDevelopment))
-        {
-            if (isDevelopment)
-            {
-                logger.LogWarning(
-                    "This sink is running in the Development environment: the connection is not " +
-                    "encrypted{Unauthenticated}. Do not expose it beyond your own machine.",
-                    _options.HasCredentials ? string.Empty : " and mail is accepted from anyone");
-            }
-            else
-            {
-                // A deployed sink with TLS switched off. Loud, and repeated on every start,
-                // because the whole point of the setting is to be temporary: the credentials and
-                // the mail are on the wire in clear text for anyone on the path to read.
-                logger.LogWarning(
-                    "TLS IS DISABLED. MailSink:TlsMode is None and this is the {Environment} " +
-                    "environment, so this sink accepts mail over an unencrypted connection: the " +
-                    "password every sender authenticates with, and the mail itself, cross the " +
-                    "network in clear text and can be read or altered in transit. This is a " +
-                    "diagnostic setting. Set TlsMode back to StartTls or Implicit as soon as the " +
-                    "test is done, and treat any credential used against it as compromised.",
-                    environment.EnvironmentName);
-            }
-        }
+        // Every connection to this sink is plain text, so this is not a conditional warning any
+        // more: it is what the sink is. Said on every start so it cannot become invisible.
+        logger.LogWarning(
+            "This sink is not encrypted. Mail{Credentials} crosses the network in clear text and " +
+            "can be read or altered in transit. Put it only where that traffic is already " +
+            "trusted; see SECURITY.md.",
+            _options.HasCredentials
+                ? ", and the password every sender authenticates with,"
+                : " is accepted from anyone and");
 
         try
         {
@@ -110,7 +85,7 @@ public sealed class SmtpListenerService(
             // one depends on the runtime: Docker allows it, Azure Container Instances does not.
             // Diagnosing that from the raw exception cost an afternoon; say it plainly instead.
             throw new InvalidOperationException(
-                $"Could not bind {DescribeTransport(_options, isDevelopment)} as this user. Ports " +
+                $"Could not bind {DescribeTransport(_options)} as this user. Ports " +
                 "below 1024 are privileged, and not every container runtime lets a non-root " +
                 "process bind one -- Azure Container Instances does not. Move the listener above " +
                 "1024 with MailSink:Port, and publish or forward the port senders should see.",
@@ -125,24 +100,8 @@ public sealed class SmtpListenerService(
     }
 
     /// <summary>One line for the startup log, so the transport in force is never in doubt.</summary>
-    private static string DescribeTransport(MailSinkOptions options, bool isDevelopment)
-    {
-        var port = SmtpOptionsFactory.ResolvePort(options, isDevelopment);
-
-        if (SmtpOptionsFactory.IsPlainText(options, isDevelopment))
-        {
-            return $"plain text on port {port}, no TLS";
-        }
-
-        var mode = options.TlsMode == SmtpTlsMode.Implicit ? "implicit TLS" : "STARTTLS";
-        var floor = options.Tls.Protocols switch
-        {
-            SslProtocols.Tls13 => "TLS 1.3 only",
-            SslProtocols.Tls12 => "TLS 1.2 only",
-            _ => "TLS 1.2+",
-        };
-        return $"{mode} on port {port} ({floor})";
-    }
+    private static string DescribeTransport(MailSinkOptions options) =>
+        $"plain text on port {SmtpOptionsFactory.ResolvePort(options)}, no TLS";
 
     /// <summary>
     /// One line for the startup log, so a misconfigured credential pair shows up immediately
@@ -177,9 +136,9 @@ public sealed class SmtpListenerService(
         var address = SessionClient.Address(e.Context);
         _sessions[e.Context] = address;
 
-        // Before TLS, before the greeting. A client that fails in the handshake and a client that
-        // never reached the sink at all look identical without this line, and telling those two
-        // apart is most of diagnosing a sender that "just fails".
+        // Before the greeting, so a client that connects and then gives up is distinguishable
+        // from one that never reached the sink at all. Telling those two apart is most of
+        // diagnosing a sender that "just fails".
         logger.LogInformation(
             "session {SessionId} accepted from {Client}",
             e.Context.SessionId,

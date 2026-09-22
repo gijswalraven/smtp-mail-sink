@@ -1,4 +1,3 @@
-using System.Security.Authentication;
 using MailSink;
 
 namespace MailSink.Tests;
@@ -12,56 +11,22 @@ public class SmtpOptionsFactoryTests
         {
             Username = "app",
             Password = "s3cret",
-            Tls = { KeyVaultCertificateUri = "https://v.vault.azure.net/certificates/smtp" },
         };
 
         configure?.Invoke(options);
         return options;
     }
 
-    [Theory]
-    [InlineData(SmtpTlsMode.StartTls, MailSinkOptions.DefaultStartTlsPort)]
-    [InlineData(SmtpTlsMode.Implicit, MailSinkOptions.DefaultImplicitTlsPort)]
-    [InlineData(SmtpTlsMode.None, MailSinkOptions.DefaultPort)]
-    public void ResolvePort_falls_back_to_the_conventional_port_for_the_mode(
-        SmtpTlsMode mode, int expected)
+    [Fact]
+    public void ResolvePort_falls_back_to_the_default_when_none_is_configured()
     {
-        var port = SmtpOptionsFactory.ResolvePort(new MailSinkOptions { TlsMode = mode }, isDevelopment: false);
-
-        Assert.Equal(expected, port);
+        Assert.Equal(MailSinkOptions.DefaultPort, SmtpOptionsFactory.ResolvePort(new MailSinkOptions()));
     }
 
     [Fact]
-    public void A_development_run_without_a_certificate_listens_on_the_plain_text_port()
+    public void ResolvePort_keeps_a_configured_port()
     {
-        // Regression: TlsMode stays at its StartTls default when no certificate is configured,
-        // and resolving the port from the mode alone put the sink on 587 while compose published
-        // 1025, so nothing could reach it.
-        var port = SmtpOptionsFactory.ResolvePort(new MailSinkOptions(), isDevelopment: true);
-
-        Assert.Equal(MailSinkOptions.DefaultPort, port);
-    }
-
-    [Fact]
-    public void A_configured_certificate_puts_it_back_on_the_submission_port()
-    {
-        var options = new MailSinkOptions
-        {
-            Tls = { KeyVaultCertificateUri = "https://v.vault.azure.net/certificates/smtp" },
-        };
-
-        Assert.Equal(MailSinkOptions.DefaultStartTlsPort, SmtpOptionsFactory.ResolvePort(options, isDevelopment: true));
-    }
-
-    [Theory]
-    [InlineData(SmtpTlsMode.StartTls)]
-    [InlineData(SmtpTlsMode.Implicit)]
-    [InlineData(SmtpTlsMode.None)]
-    public void ResolvePort_keeps_a_configured_port_whatever_the_mode(SmtpTlsMode mode)
-    {
-        var port = SmtpOptionsFactory.ResolvePort(new MailSinkOptions { Port = 2525, TlsMode = mode }, isDevelopment: false);
-
-        Assert.Equal(2525, port);
+        Assert.Equal(2525, SmtpOptionsFactory.ResolvePort(new MailSinkOptions { Port = 2525 }));
     }
 
     [Fact]
@@ -79,7 +44,7 @@ public class SmtpOptionsFactoryTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => SmtpOptionsFactory.ResolveAddress(options));
 
-        Assert.Contains("localhost", ex.Message);
+        Assert.Contains("is not a valid IP address", ex.Message);
     }
 
     [Fact]
@@ -94,7 +59,7 @@ public class SmtpOptionsFactoryTests
             o.MaxAuthenticationAttempts = 2;
         });
 
-        var built = SmtpOptionsFactory.Build(options, isDevelopment: false, new FakeCertificateFactory());
+        var built = SmtpOptionsFactory.Build(options, isDevelopment: false);
 
         Assert.Equal("test-sink", built.ServerName);
         Assert.Equal(2525, Assert.Single(built.Endpoints).Endpoint.Port);
@@ -102,93 +67,39 @@ public class SmtpOptionsFactoryTests
     }
 
     [Fact]
-    public void Build_opens_one_STARTTLS_endpoint_by_default()
+    public void Build_opens_one_unencrypted_endpoint()
     {
-        var built = SmtpOptionsFactory.Build(Deployed(), isDevelopment: false, new FakeCertificateFactory());
+        var options = Deployed(o => o.ListenAddress = "127.0.0.1");
 
-        var endpoint = Assert.Single(built.Endpoints);
-        Assert.False(endpoint.IsSecure);
-        Assert.Equal(MailSinkOptions.DefaultStartTlsPort, endpoint.Endpoint.Port);
-    }
-
-    [Fact]
-    public void Build_opens_one_implicit_TLS_endpoint_when_the_mode_says_so()
-    {
-        var options = Deployed(o => o.TlsMode = SmtpTlsMode.Implicit);
-
-        var built = SmtpOptionsFactory.Build(options, isDevelopment: false, new FakeCertificateFactory());
-
-        var endpoint = Assert.Single(built.Endpoints);
-        Assert.True(endpoint.IsSecure);
-        Assert.Equal(MailSinkOptions.DefaultImplicitTlsPort, endpoint.Endpoint.Port);
-    }
-
-    [Fact]
-    public void Build_never_opens_a_second_endpoint_for_the_other_mode()
-    {
-        // The point of the single-port shape: asking for one mode does not quietly also listen
-        // on the other, which is what the two port lists used to do.
-        foreach (var mode in new[] { SmtpTlsMode.StartTls, SmtpTlsMode.Implicit })
-        {
-            var built = SmtpOptionsFactory.Build(
-                Deployed(o => o.TlsMode = mode), isDevelopment: false, new FakeCertificateFactory());
-
-            Assert.Single(built.Endpoints);
-        }
-    }
-
-    [Fact]
-    public void Build_requires_auth_and_refuses_it_unencrypted_on_every_deployed_endpoint()
-    {
-        var built = SmtpOptionsFactory.Build(Deployed(), isDevelopment: false, new FakeCertificateFactory());
-
-        Assert.NotEmpty(built.Endpoints);
-        Assert.All(built.Endpoints, e => Assert.True(e.AuthenticationRequired));
-        Assert.All(built.Endpoints, e => Assert.False(e.AllowUnsecureAuthentication));
-        Assert.All(built.Endpoints, e => Assert.NotNull(e.CertificateFactory));
-    }
-
-    [Theory]
-    [InlineData(TlsProtocolVersion.Tls12, TlsProtocolVersion.Tls13, SslProtocols.Tls12 | SslProtocols.Tls13)]
-    [InlineData(TlsProtocolVersion.Tls13, TlsProtocolVersion.Tls13, SslProtocols.Tls13)]
-    [InlineData(TlsProtocolVersion.Tls12, TlsProtocolVersion.Tls12, SslProtocols.Tls12)]
-    public void Build_pins_the_protocol_range(
-        TlsProtocolVersion floor, TlsProtocolVersion ceiling, SslProtocols expected)
-    {
-        var options = Deployed(o =>
-        {
-            o.Tls.MinimumProtocol = floor;
-            o.Tls.MaximumProtocol = ceiling;
-        });
-
-        var built = SmtpOptionsFactory.Build(options, isDevelopment: false, new FakeCertificateFactory());
-
-        Assert.All(built.Endpoints, e => Assert.Equal(expected, e.SupportedSslProtocols));
-    }
-
-    [Fact]
-    public void Build_listens_in_plain_text_in_development()
-    {
-        var built = SmtpOptionsFactory.Build(
-            new MailSinkOptions { Port = 2525, TlsMode = SmtpTlsMode.None },
-            isDevelopment: true,
-            certificateFactory: null);
+        var built = SmtpOptionsFactory.Build(options, isDevelopment: false);
 
         var endpoint = Assert.Single(built.Endpoints);
         Assert.False(endpoint.IsSecure);
         Assert.Null(endpoint.CertificateFactory);
+        Assert.Equal(MailSinkOptions.DefaultPort, endpoint.Endpoint.Port);
+    }
 
-        // No credentials configured, so nothing to authenticate against and nothing to protect.
-        Assert.False(endpoint.AuthenticationRequired);
+    [Fact]
+    public void Build_requires_auth_but_has_to_offer_it_unencrypted()
+    {
+        // There is no encrypted connection to wait for any more, so AUTH is offered as-is. This
+        // test exists to make that trade explicit rather than incidental.
+        var options = Deployed(o => o.ListenAddress = "127.0.0.1");
+
+        var built = SmtpOptionsFactory.Build(options, isDevelopment: false);
+
+        var endpoint = Assert.Single(built.Endpoints);
+        Assert.True(endpoint.AuthenticationRequired);
         Assert.True(endpoint.AllowUnsecureAuthentication);
     }
 
     [Fact]
-    public void Build_uses_TLS_in_development_too_once_a_certificate_is_configured()
+    public void Build_does_not_require_auth_when_no_credentials_are_configured()
     {
-        var built = SmtpOptionsFactory.Build(Deployed(), isDevelopment: true, new FakeCertificateFactory());
+        var built = SmtpOptionsFactory.Build(new MailSinkOptions(), isDevelopment: true);
 
-        Assert.All(built.Endpoints, e => Assert.NotNull(e.CertificateFactory));
+        var endpoint = Assert.Single(built.Endpoints);
+        Assert.False(endpoint.AuthenticationRequired);
     }
 
     [Fact]
@@ -214,97 +125,13 @@ public class SmtpOptionsFactoryTests
     [Fact]
     public void Validate_accepts_a_bare_development_run()
     {
-        // No credentials, no certificate: the local sink stays zero-configuration.
         new MailSinkOptions().Validate(isDevelopment: true);
     }
 
     [Fact]
     public void Validate_refuses_to_deploy_without_credentials()
     {
-        var options = new MailSinkOptions
-        {
-            Tls = { KeyVaultCertificateUri = "https://v.vault.azure.net/certificates/smtp" },
-        };
-
-        var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
-
-        Assert.Contains("MailSink:Accounts, or the MailSink:Username and MailSink:Password pair, is", ex.Message);
-    }
-
-
-    [Fact]
-    public void Validate_refuses_a_protocol_range_that_offers_nothing()
-    {
-        var options = Deployed(o =>
-        {
-            o.Tls.MinimumProtocol = TlsProtocolVersion.Tls13;
-            o.Tls.MaximumProtocol = TlsProtocolVersion.Tls12;
-        });
-
-        var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
-
-        Assert.Contains("leaves no version to negotiate", ex.Message);
-    }
-
-    [Fact]
-    public void MaximumProtocol_Tls12_takes_1_3_off_the_table()
-    {
-        // The diagnostic case: a client whose TLS stack cannot complete a 1.3 handshake.
-        var options = Deployed(o => o.Tls.MaximumProtocol = TlsProtocolVersion.Tls12);
-
-        Assert.Equal(SslProtocols.Tls12, options.Tls.Protocols);
-        Assert.False(options.Tls.Protocols.HasFlag(SslProtocols.Tls13));
-    }
-
-    [Fact]
-    public void Validate_refuses_to_deploy_without_a_certificate()
-    {
-        var options = new MailSinkOptions { Username = "app", Password = "s3cret" };
-
-        var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
-
-        Assert.Contains("MailSink:Tls:KeyVaultCertificateUri is required", ex.Message);
-    }
-
-    [Fact]
-    public void Validate_allows_TlsMode_None_outside_development_as_a_deliberate_opt_out()
-    {
-        // Switching TLS off in a deployment is how a sender that fails against TLS is told apart
-        // from one that fails for another reason. It is allowed, warned about, and not silent.
-        var options = Deployed(o =>
-        {
-            o.TlsMode = SmtpTlsMode.None;
-            o.AllowPlainTextFromAnyAddress = true;
-        });
-
-        options.Validate(isDevelopment: false);
-
-        Assert.True(options.IsPlainText(isDevelopment: false));
-    }
-
-    [Fact]
-    public void Validate_does_not_require_a_certificate_when_TlsMode_is_None()
-    {
-        var options = new MailSinkOptions
-        {
-            Username = "app",
-            Password = "s3cret",
-            TlsMode = SmtpTlsMode.None,
-            AllowPlainTextFromAnyAddress = true,
-        };
-
-        options.Validate(isDevelopment: false);
-    }
-
-    [Fact]
-    public void Validate_still_requires_credentials_when_TlsMode_is_None()
-    {
-        // One control at a time: dropping TLS for a test does not also open the sink to anyone.
-        var options = new MailSinkOptions
-        {
-            TlsMode = SmtpTlsMode.None,
-            AllowPlainTextFromAnyAddress = true,
-        };
+        var options = new MailSinkOptions { ListenAddress = "127.0.0.1" };
 
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
 
@@ -312,39 +139,16 @@ public class SmtpOptionsFactoryTests
     }
 
     [Fact]
-    public void Validate_still_refuses_an_unencrypted_listener_that_anything_can_reach()
+    public void Validate_refuses_a_port_that_is_not_one()
     {
-        // TlsMode None does not waive the reach guard; a deployment has to say so separately.
         var options = Deployed(o =>
         {
-            o.TlsMode = SmtpTlsMode.None;
-            o.ListenAddress = "0.0.0.0";
+            o.ListenAddress = "127.0.0.1";
+            o.Port = 70000;
         });
 
         var ex = Assert.Throws<InvalidOperationException>(() => options.Validate(isDevelopment: false));
 
-        Assert.Contains("AllowPlainTextFromAnyAddress", ex.Message);
-    }
-
-    [Fact]
-    public void Build_opens_an_unencrypted_endpoint_when_TlsMode_is_None_outside_development()
-    {
-        var options = Deployed(o =>
-        {
-            o.TlsMode = SmtpTlsMode.None;
-            o.AllowPlainTextFromAnyAddress = true;
-            o.Port = 2525;
-        });
-
-        var built = SmtpOptionsFactory.Build(options, isDevelopment: false, certificateFactory: null);
-
-        var endpoint = Assert.Single(built.Endpoints);
-        Assert.False(endpoint.IsSecure);
-        Assert.Null(endpoint.CertificateFactory);
-        Assert.Equal(2525, endpoint.Endpoint.Port);
-
-        // Credentials are still required, and now necessarily travel in the clear.
-        Assert.True(endpoint.AuthenticationRequired);
-        Assert.True(endpoint.AllowUnsecureAuthentication);
+        Assert.Contains("not a usable port", ex.Message);
     }
 }

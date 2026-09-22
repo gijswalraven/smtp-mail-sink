@@ -40,11 +40,8 @@
     that VNet - peered networks, VPN, or other Azure resources in it.
 
     Public gives it a public IP and an <dns-label>.<region>.azurecontainer.io FQDN. Every session
-    has to authenticate over TLS either way, but the sink still accepts any recipient, so a public
-    endpoint will be found by scanners and probed. Prefer Private unless you need otherwise.
-
-    The certificate is issued for that FQDN when Public, so senders can verify it by name. Pass
-    -CertificateSubject to issue it for the name your senders will actually use instead.
+    has to authenticate either way, but the connection is never encrypted and the sink accepts
+    any recipient, so a public endpoint will be found by scanners and probed. Prefer Private.
 
 .PARAMETER SmtpUsername
     Username the sink will require, for a sink with one client. Stored in the key vault alongside
@@ -72,15 +69,6 @@
 .PARAMETER RotatePassword
     Replace the stored password with a freshly generated one, even though a secret already exists.
     With -Accounts, every listed account is rotated.
-
-.PARAMETER CertificateSubject
-    Host name the TLS certificate is issued for. Defaults to the container group's public FQDN for
-    -Exposure Public, and to <name-prefix>.internal for Private, where there is no name to use.
-    Set it to whatever senders will put in their SMTP host setting.
-
-    The certificate is self-signed, because nothing else can be issued without a public DNS zone.
-    Senders must therefore trust it explicitly. Replace it in the key vault with one from your own
-    CA to avoid that, and the sink will pick the replacement up on its next restart.
 
 .PARAMETER RetentionHours
     How long the sink keeps a captured message before deleting it. Defaults to 168, a week, on the
@@ -141,24 +129,6 @@ param(
     # balancer in front if they cannot.
     [int]$Port = 2587,
 
-    # One port, one mode. StartTls begins in plain text and requires STARTTLS before AUTH;
-    # Implicit is TLS from the first byte. They cannot share a port -- implicit TLS has the client
-    # open with a handshake and STARTTLS has the server open with a greeting -- so senders are
-    # told which one this sink speaks.
-    #
-    # None switches TLS off entirely, which is a diagnostic setting and nothing else: it is the
-    # only way to tell a sender that fails because of TLS from one that fails for another reason.
-    # The password and the mail then cross the network in clear text. The sink warns on every
-    # start, and so does the summary at the end of this script.
-    [ValidateSet('StartTls', 'Implicit', 'None')]
-    [string]$TlsMode = 'StartTls',
-
-    # Highest TLS version offered. Tls13 by default. Set Tls12 to stop offering 1.3, which is a
-    # diagnostic lever for a client whose TLS stack aborts a 1.3 handshake -- that shows up here
-    # as a session faulting mid-handshake and says nothing about which end is at fault.
-    [ValidateSet('Tls12', 'Tls13')]
-    [string]$MaxTlsVersion = 'Tls13',
-
     # Not published. The liveness probe reaches it inside the container group; a sender cannot.
     [int]$HealthPort = 8080,
 
@@ -187,9 +157,6 @@ param(
     # Several clients instead of one: a credential pair and a folder per name. Supersedes
     # -SmtpUsername, which is the single-client shorthand.
     [string[]]$Accounts = @(),
-
-    # Empty means "derive from -Exposure": the public FQDN, or <prefix>.internal when private.
-    [string]$CertificateSubject,
 
     # Rebuild even when an image tagged with the current source hash already exists.
     [switch]$ForceBuild,
@@ -311,64 +278,6 @@ function Set-VaultSecret {
     }
 }
 
-# A self-signed certificate, because nothing else can be issued without a public DNS zone to
-# prove control of. az takes a policy only as a file, which suits us: the policy is long.
-function New-VaultCertificate {
-    param(
-        [Parameter(Mandatory)][string]$VaultName,
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$Subject
-    )
-
-    # exportable is the setting that matters: without it the private key cannot be read back
-    # through the secret of the same name, and a certificate the sink cannot download in full is
-    # no use for terminating TLS.
-    $policy = [ordered]@{
-        issuerParameters          = @{ name = 'Self' }
-        keyProperties             = [ordered]@{
-            exportable = $true
-            keySize    = 2048
-            keyType    = 'RSA'
-            reuseKey   = $false
-        }
-        secretProperties          = @{ contentType = 'application/x-pkcs12' }
-        x509CertificateProperties = [ordered]@{
-            subject                 = "CN=$Subject"
-            subjectAlternativeNames = @{ dnsNames = @($Subject) }
-            validityInMonths        = 12
-            keyUsage                = @('digitalSignature', 'keyEncipherment')
-            ekus                    = @('1.3.6.1.5.5.7.3.1')
-        }
-        lifetimeActions           = @(
-            @{
-                trigger = @{ daysBeforeExpiry = 30 }
-                action  = @{ actionType = 'AutoRenew' }
-            }
-        )
-    }
-
-    $file = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
-    try {
-        [IO.File]::WriteAllText($file, ($policy | ConvertTo-Json -Depth 6))
-
-        for ($attempt = 1; ; $attempt++) {
-            try {
-                Invoke-Az @('keyvault', 'certificate', 'create', '--vault-name', $VaultName,
-                    '-n', $Name, '--policy', "@$file", '-o', 'none') | Out-Null
-                return
-            }
-            catch {
-                if ($attempt -ge 8) { throw }
-                Write-Host "    waiting for the vault role assignment to reach the data plane (attempt $attempt)"
-                Start-Sleep -Seconds 10
-            }
-        }
-    }
-    finally {
-        Remove-Item $file -Force -ErrorAction SilentlyContinue
-    }
-}
-
 function Test-VaultSecret {
     param([Parameter(Mandatory)][string]$VaultName, [Parameter(Mandatory)][string]$Name)
 
@@ -390,21 +299,8 @@ if ($Exposure -eq 'Public' -and -not $DnsLabel) {
     throw 'A -DnsLabel is required when -Exposure is Public.'
 }
 
-# Senders verify the certificate against the name they connect to. A public deployment has one
-# that is known in advance; a private one has only an IP, so it gets a stable placeholder that
-# whoever runs it can point DNS at -- or override with -CertificateSubject.
-if (-not $CertificateSubject) {
-    $CertificateSubject = if ($Exposure -eq 'Public') {
-        "$DnsLabel.$Location.azurecontainer.io"
-    }
-    else {
-        "$NamePrefix.internal"
-    }
-}
-
-# Nothing to decide any more: outside the Development environment the sink refuses to start
-# without a credential pair and a certificate, and refuses mail from a session that has not used
-# both. The container has no DOTNET_ENVIRONMENT set, so it runs as Production.
+# Outside the Development environment the sink refuses to start without a credential pair. The
+# container has no DOTNET_ENVIRONMENT set, so it runs as Production.
 
 # -Force exists for unattended runs, which is exactly where nobody is watching which subscription
 # the az CLI happens to be pointed at. Skipping the confirmation and leaving the target implicit
@@ -467,7 +363,6 @@ $legacyShareName = 'mail'
 
 $usernameSecret = 'mailsink-smtp-username'
 $passwordSecret = 'mailsink-smtp-password'
-$tlsCertificate = 'mailsink-smtp-tls'
 
 # One entry per credential pair the sink will accept, so everything below -- the vault secrets,
 # the container's environment, the summary -- is written once against a list rather than twice
@@ -857,38 +752,6 @@ finally {
 
 $newVaultAssignment = Grant-Role -PrincipalId $principalId -Role 'Key Vault Secrets User' -Scope $vaultId
 
-Step "Key vault certificate ($tlsCertificate)"
-
-Grant-Role -PrincipalId $callerObjectId -Role 'Key Vault Certificates Officer' -Scope $vaultId -PrincipalType $callerType | Out-Null
-
-# Reissuing on every run would hand senders a new certificate to trust each time, so the stored
-# one is kept unless it is for a different name than the deployment now uses.
-$currentSubject = & az keyvault certificate show --vault-name $vaultName -n $tlsCertificate --query 'policy.x509CertificateProperties.subject' -o tsv 2>$null
-$global:LASTEXITCODE = 0
-
-if ($currentSubject -eq "CN=$CertificateSubject") {
-    Write-Host "    certificate for '$CertificateSubject' already stored"
-}
-else {
-    if ($currentSubject) {
-        Write-Host "    reissuing: the stored certificate is '$currentSubject', not 'CN=$CertificateSubject'"
-    }
-    else {
-        Write-Host "    issuing a self-signed certificate for '$CertificateSubject'"
-    }
-
-    New-VaultCertificate -VaultName $vaultName -Name $tlsCertificate -Subject $CertificateSubject
-}
-
-# The sink downloads the private key through the secret backing the certificate, so it needs both
-# roles: Certificate User to see the certificate, Secrets User (granted just above) to read it.
-if (Grant-Role -PrincipalId $principalId -Role 'Key Vault Certificate User' -Scope $vaultId) {
-    $newVaultAssignment = $true
-}
-
-# The container is handed vault URIs, not secrets. Versionless, so restarting picks up a rotation.
-$certificateUri = "https://$vaultHost/certificates/$tlsCertificate"
-
 Step "Blob container access ($($containers -join ', '))"
 
 $newBlobAssignment = $false
@@ -942,14 +805,13 @@ $environment = [ordered]@{
     'MailSink__Blob__Container'                   = $defaultContainer
     'MailSink__Blob__ManagedIdentityClientId'     = $identityClientId
     # The sink binds loopback unless told otherwise, which inside a container group would make
-    # it unreachable. With TLS on that is not the unencrypted case AllowPlainTextFromAnyAddress
-    # guards; with -TlsMode None it is exactly that case, and the waiver is set below.
+    # it unreachable. Nothing here is encrypted, so that is exactly the case
+    # AllowPlainTextFromAnyAddress guards, and the waiver has to be explicit.
     'MailSink__ListenAddress'                     = '0.0.0.0'
+    'MailSink__AllowPlainTextFromAnyAddress'      = 'true'
     # The image already listens on these, but naming them keeps the published ports and the
     # listener from drifting apart when either is changed.
     'MailSink__Port'                              = "$Port"
-    'MailSink__TlsMode'                           = $TlsMode
-    'MailSink__Tls__MaximumProtocol'              = $MaxTlsVersion
     # Not published, so it is reachable by the probe and not by a sender.
     'MailSink__HealthPort'                        = "$HealthPort"
     # The sink sweeps the blob container itself; 0 means it deletes nothing.
@@ -960,28 +822,11 @@ $environment = [ordered]@{
     'Logging__Console__TimestampFormat'           = '[yyyy-MM-dd HH:mm:ss] '
     'Logging__Console__UseUtcTimestamp'           = 'true'
     'TZ'                                          = $TimeZone
-    # Not a secret: the certificate's private key is fetched through the managed identity.
-    'MailSink__Tls__KeyVaultCertificateUri'       = $certificateUri
     # Naming the one vault the sink may read means a reference pointing anywhere else is refused
     # rather than fetched.
     'MailSink__KeyVault__AllowedHosts__0'         = $vaultHost
     # A container group can carry several identities; the default credential cannot guess.
     'MailSink__KeyVault__ManagedIdentityClientId' = $identityClientId
-}
-
-# TLS off is the one case where an unencrypted listener is deliberately reachable from the
-# network, so the guard that normally refuses that combination has to be waived explicitly. The
-# certificate stays in the vault and its URI is dropped rather than deleted, so switching back is
-# a re-run with -TlsMode StartTls and nothing else.
-if ($TlsMode -eq 'None') {
-    $environment.Remove('MailSink__Tls__KeyVaultCertificateUri')
-    $environment['MailSink__AllowPlainTextFromAnyAddress'] = 'true'
-
-    Write-Warning ('-TlsMode None: this sink will accept mail over an unencrypted connection. ' +
-        'The password every sender authenticates with, and the mail itself, will cross the ' +
-        'public internet in clear text. Use it to isolate a TLS problem and then re-run with ' +
-        '-TlsMode StartTls; treat the password as compromised afterwards and rotate it with ' +
-        '-RotatePassword.')
 }
 
 # The credentials, as references rather than values. MailSink:Username and MailSink:Accounts are
@@ -1043,7 +888,7 @@ $group = [ordered]@{
     identity   = [ordered]@{
         type                   = 'UserAssigned'
         # Attached whether or not it is also pulling the image: the sink needs it to read the
-        # credentials and the certificate out of the vault, and to store captured mail in the blob
+        # credentials out of the vault, and to store captured mail in the blob
         # container, which is the only way it can reach either.
         userAssignedIdentities = @{ $identityId = @{} }
     }
@@ -1063,7 +908,7 @@ $group = [ordered]@{
                     )
                     livenessProbe        = [ordered]@{
                         httpGet             = [ordered]@{ path = '/healthz'; port = $HealthPort; scheme = 'http' }
-                        # The sink has to reach Key Vault for its certificate before it answers,
+                        # The sink has to reach Key Vault for its credentials before it answers,
                         # and on a cold start the role assignment may still be propagating, so the
                         # first check waits rather than restarting a container that is fine.
                         initialDelaySeconds = 30
@@ -1247,12 +1092,7 @@ else {
     Write-Host "  SMTP host : $ip (private, reachable from $VNetName only)"
 }
 
-$modeSummary = switch ($TlsMode) {
-    'Implicit' { 'implicit TLS, encrypted from the first byte' }
-    'None' { 'NO TLS -- plain text, credentials in the clear' }
-    default { 'STARTTLS, required before AUTH' }
-}
-Write-Host "  SMTP port : $Port ($modeSummary)"
+Write-Host "  SMTP port : $Port (plain text -- no TLS)"
 
 if ($Accounts) {
     Write-Host "  SMTP users: $(($accountList | ForEach-Object { "$($_.Username) -> $($_.Container)" }) -join ', ')"
@@ -1261,17 +1101,7 @@ else {
     Write-Host "  SMTP user : $SmtpUsername"
 }
 
-$authSummary = $TlsMode -eq 'None' `
-    ? '  Auth      : required, but offered over an UNENCRYPTED connection' `
-    : '  Auth      : required, over TLS only'
-Write-Host $authSummary
-if ($TlsMode -eq 'None') {
-    Write-Host "  Cert      : not presented -- TLS is off (it stays in the vault for the way back)"
-}
-else {
-    $protocolSummary = $MaxTlsVersion -eq 'Tls12' ? 'TLS 1.2 only' : 'TLS 1.2+'
-    Write-Host "  Cert for  : $CertificateSubject (self-signed, $protocolSummary)"
-}
+Write-Host '  Auth      : required, and offered over an UNENCRYPTED connection'
 Write-Host "  Health    : liveness probe on http://<container>:$HealthPort/healthz"
 Write-Host "  Mail store: $blobEndpoint, one container per account: $($containers -join ', ')"
 Write-Host '  Mail access: managed identity to write, an Entra ID role per container to read, no account key'
@@ -1286,31 +1116,10 @@ foreach ($account in $accountList) {
     Write-Host "  az keyvault secret show --vault-name $vaultName -n $($account.PasswordSecret) --query value -o tsv"
 }
 Write-Host ''
-if ($TlsMode -eq 'None') {
-    Write-Host 'TLS IS OFF. Senders need no certificate and must not use one: configure them for a' -ForegroundColor Yellow
-    Write-Host 'plain connection with no STARTTLS and no SSL. The password is sent in clear text and' -ForegroundColor Yellow
-    Write-Host 'so is the mail. Re-run with -TlsMode StartTls when the test is done, then rotate the' -ForegroundColor Yellow
-    Write-Host 'password with -RotatePassword.' -ForegroundColor Yellow
-}
-else {
-    Write-Host 'The certificate is self-signed, so senders must be told to trust it. Export the public'
-    Write-Host 'half and install it wherever the sending application keeps its trusted roots:'
-    Write-Host "  az keyvault certificate download --vault-name $vaultName -n $tlsCertificate -f mailsink.crt"
-    Write-Host ''
-    Write-Host 'Senders must also reach it by the name on the certificate. Connecting to the bare IP'
-    Write-Host 'will fail host name validation, which is the check doing the work here.'
-}
+Write-Host 'This sink is not encrypted. Configure senders for a plain connection: no SSL, no' -ForegroundColor Yellow
+Write-Host 'STARTTLS, no certificate. The password and the mail both cross the network in clear' -ForegroundColor Yellow
+Write-Host 'text, so put it only where that traffic is already trusted.' -ForegroundColor Yellow
 Write-Host ''
-
-if ($newVaultAssignment -or $newBlobAssignment) {
-    Write-Host 'A role assignment was created just now. Until it propagates the sink cannot read its' -ForegroundColor Yellow
-    Write-Host 'credentials or store a message, so it may restart, and a delivery in that window is' -ForegroundColor Yellow
-    Write-Host 'refused with a 451 for the sender to retry. It settles within a minute or two.' -ForegroundColor Yellow
-    Write-Host ''
-}
-
-# --auth-mode login is the whole difference: the CLI uses the identity you are signed in as and
-# the role granted above, so nothing here fetches, prints or stores an account key.
 Write-Host 'Read the captured mail as yourself -- there is no account key to fetch:'
 foreach ($container in $containers) {
     Write-Host "  az storage blob list --account-name $storageName -c $container --auth-mode login --query '[].name' -o tsv"

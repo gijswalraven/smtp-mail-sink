@@ -7,36 +7,32 @@ see exactly what an application sent. It is built to run in a deployed environme
 developer's machine.
 
 Outside the `Development` environment it refuses to start without a credential pair, and it
-refuses any session that has not authenticated. There is no way to switch that off. It also
-refuses to start without a TLS certificate, with one deliberate exception described below.
+refuses any session that has not authenticated. There is no way to switch that off.
 
-With TLS in force it refuses any session not encrypted with TLS 1.2 or better, and AUTH is never
-advertised across an unencrypted connection, so credentials cannot cross the wire in the clear
-even from a client that would have been willing to send them.
+**It does not do TLS at all.** Every connection is plain text, in every environment. The password
+each sender authenticates with, and the mail itself, cross the network in the clear and can be
+read or altered by anything on the path. This is the central trade: the sink is a test fixture,
+and it is only safe where that traffic is already trusted.
 
 What the sink still does by design:
 
 - accepts any recipient address — it is a sink, not a router, and nothing is ever forwarded,
 - stores every message unencrypted on disk, headers and body included,
 - holds each account's password in Key Vault as a readable secret rather than as a hash,
-- listens in plain text when `MailSink:TlsMode` is `None`, in **any** environment,
-- in the `Development` environment, listens in plain text with no certificate configured at all
-  and, unless credentials are configured, accepts mail from anyone. This is what keeps a local
-  run zero-configuration.
+- offers AUTH across that unencrypted connection, because there is no encrypted one to wait for,
+- in the `Development` environment, unless credentials are configured, accepts mail from anyone.
+  This is what keeps a local run zero-configuration.
 
-`TlsMode: None` is a diagnostic escape hatch. It exists because a sender that fails against a
-sink cannot otherwise be told apart from a sender that fails *because of* TLS, and answering that
-question is often the fastest way to find the real fault. It is deliberately not quiet: the
-listener logs a warning naming the environment on every start, and `deploy.ps1` warns again when
-it is used. It does not relax authentication — credentials are still required, and a session that
-does not authenticate still gets nowhere — but it does put the password and the mail on the wire
-in clear text, where anyone on the path can read or alter them. Treat any credential used against
-a sink in that state as compromised and rotate it, and set the mode back as soon as the test is
-over.
+The one guard that remains around the plain-text transport is reach. The listener binds loopback
+by default and refuses any other address unless `MailSink:AllowPlainTextFromAnyAddress` is set,
+so putting an unencrypted sink on a network is a deliberate act rather than something arrived at
+by leaving a default in place. `deploy.ps1` sets that waiver, because a container group has to
+bind `0.0.0.0` to be reachable at all -- which is exactly why a public deployment deserves the
+scrutiny the README asks for.
 
 The `Development` relaxation is separate and bounded. `deploy.ps1` never sets
 `DOTNET_ENVIRONMENT`, so a deployed container runs as `Production`: it needs credentials, and it
-needs a certificate unless `TlsMode` explicitly says otherwise.
+needs them whether or not anyone is watching.
 
 Per-account folders on a filesystem are not an access boundary. They keep one client's mail out of
 another's listing, and nothing reads mail back out over SMTP, but anyone who can reach the mail
@@ -66,19 +62,15 @@ logs. A deployment that predates this still has an Azure Files share with mail o
 will not disable the key while that share exists, because SMB cannot be reached without it.
 
 Reports that amount to "the Development mode accepts any password", "stored messages are not
-encrypted", "the SMTP passwords are not hashed", or "TlsMode None sends credentials in clear
-text" will be closed with a pointer to this page.
+encrypted", "the SMTP passwords are not hashed", or "the sink sends credentials in clear text"
+will be closed with a pointer to this page.
 
 ## What is a vulnerability
 
 Report it if you find a way to:
 
-- deliver a message without authenticating, in any environment or any TLS mode,
-- deliver a message across an unencrypted connection in any environment other than `Development`,
-  unless `MailSink:TlsMode` is `None` -- switching TLS off is what that setting does, and doing it
-  without leaving the warning in the log would be the finding,
-- downgrade or strip the TLS: negotiate below TLS 1.2, get `AUTH` advertised or accepted before
-  STARTTLS has completed, or get the sink to present a certificate it was not configured with,
+- deliver a message without authenticating, in any environment,
+- bind an address other than loopback without `MailSink:AllowPlainTextFromAnyAddress` being set,
 - make `AccountUserAuthenticator` accept a credential pair it was not configured with -- one
   account's username with another's password included -- or learn from the timing or the content
   of a rejection which usernames exist,
@@ -91,7 +83,7 @@ Report it if you find a way to:
 - execute code in the sink process by sending it a message,
 - crash or wedge the process with a single message or a small number of connections, beyond the
   configured `MaxMessageSize` and session limits,
-- recover a configured password, or the certificate's private key, without a role assignment on
+- recover a configured password without a role assignment on
   the vault holding it: from a log, a file name, a stored message, an SMTP reply, or anything the
   deployment scripts leave on a command line or in the container group's definition,
 - read or write captured mail in Azure without a role assignment on the blob container holding it:
