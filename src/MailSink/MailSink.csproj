@@ -26,8 +26,8 @@
          managed identity so no storage account key exists to be handed around. -->
     <PackageReference Include="Azure.Storage.Blobs" Version="12.29.2" />
     <PackageReference Include="KeyVaultReferenceResolver" Version="2.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.13" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.13" />
     <PackageReference Include="MimeKit" Version="4.18.1" />
     <PackageReference Include="SmtpServer" Version="11.1.0" />
   </ItemGroup>
